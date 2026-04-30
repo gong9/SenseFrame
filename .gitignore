@@ -1,0 +1,14 @@
+node_modules
+dist
+out
+.venv
+__pycache__
+*.pyc
+.env
+.env.local
+.DS_Store
+*.log
+/IMG_*.JPG
+/IMG_*.JPEG
+/IMG_*.jpg
+/IMG_*.jpeg
