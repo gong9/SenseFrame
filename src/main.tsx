@@ -11,7 +11,6 @@ import {
   Image as ImageIcon,
   Layers,
   Loader2,
-  Search,
   ScanFace,
   Sparkles,
   Star,
@@ -409,29 +408,46 @@ function App(): React.ReactElement {
   const activeClusterMeta = activePhoto ? clusterMeta.get(activePhoto.id) : undefined;
   const activeBurstMeta = activePhoto ? burstMeta.get(activePhoto.id) : undefined;
   const isFitZoom = imageZoom === 1;
+  const canvasPhotoIndex = canvasPhoto ? visiblePhotos.findIndex((photo) => photo.id === canvasPhoto.id) : -1;
 
   useEffect(() => {
     setImageZoom(1);
     setImagePan({ x: 0, y: 0 });
-    setImageSize({
-      width: activePhoto?.width || 0,
-      height: activePhoto?.height || 0
-    });
 
-    if (!activePhoto?.previewPath || !window.senseframe) {
+    if (!activePhoto) {
+      setCanvasPhoto(undefined);
+      setImageSize({ width: 0, height: 0 });
+      return;
+    }
+
+    if (!activePhoto.previewPath || !window.senseframe) {
       setCanvasPhoto(activePhoto);
+      setImageSize({
+        width: activePhoto.width || 0,
+        height: activePhoto.height || 0
+      });
       return;
     }
 
     let cancelled = false;
     const loader = new window.Image();
+    loader.decoding = 'async';
     loader.onload = () => {
-      if (cancelled) return;
-      setCanvasPhoto(activePhoto);
-      setImageSize({
-        width: loader.naturalWidth || activePhoto.width || 0,
-        height: loader.naturalHeight || activePhoto.height || 0
-      });
+      const applyLoadedPhoto = () => {
+        if (cancelled) return;
+        setImageSize({
+          width: loader.naturalWidth || activePhoto.width || 0,
+          height: loader.naturalHeight || activePhoto.height || 0
+        });
+        setCanvasPhoto(activePhoto);
+      };
+
+      if (typeof loader.decode === 'function') {
+        loader.decode().catch(() => undefined).then(applyLoadedPhoto);
+        return;
+      }
+
+      applyLoadedPhoto();
     };
     loader.onerror = () => {
       if (!cancelled) setCanvasPhoto(activePhoto);
@@ -442,6 +458,27 @@ function App(): React.ReactElement {
       cancelled = true;
     };
   }, [activePhoto?.id]);
+
+  useEffect(() => {
+    if (!window.senseframe || !visiblePhotos.length) return;
+    const preload = new Set<number>([photoIndex - 2, photoIndex - 1, photoIndex + 1, photoIndex + 2]);
+    const loaders = [...preload]
+      .map((index) => visiblePhotos[index])
+      .filter((photo): photo is PhotoView => Boolean(photo?.previewPath))
+      .map((photo) => {
+        const loader = new window.Image();
+        loader.decoding = 'async';
+        loader.src = window.senseframe!.fileUrl(photo.previewPath!);
+        return loader;
+      });
+
+    return () => {
+      loaders.forEach((loader) => {
+        loader.onload = null;
+        loader.onerror = null;
+      });
+    };
+  }, [visiblePhotos, photoIndex]);
 
   useEffect(() => {
     const element = stageRef.current;
@@ -576,6 +613,18 @@ function App(): React.ReactElement {
     setNotice(`已导出：${path}`);
   }
 
+  async function exportSelected(): Promise<void> {
+    if (!batch) return;
+    if (!window.senseframe) return;
+    if (!stats.picked) {
+      setNotice('还没有标记为“保留”的照片。');
+      return;
+    }
+
+    const result = await window.senseframe.exportSelected(batch.id);
+    if (result) setNotice(`已导出 ${result.count} 张已选照片：${result.dir}`);
+  }
+
   useEffect(() => {
     function onKey(event: KeyboardEvent): void {
       if (event.target instanceof HTMLInputElement) return;
@@ -611,7 +660,7 @@ function App(): React.ReactElement {
 
         <div className="import-actions">
           <button className="primary-action" onClick={() => importSource('folder')} disabled={Boolean(importProgress)}>
-            <FolderOpen size={18} /> 导入文件夹
+            <FolderOpen size={16} /> 导入
           </button>
           <button className="secondary-action" onClick={() => importSource('archive')} disabled={Boolean(importProgress)}>RAR</button>
         </div>
@@ -626,6 +675,27 @@ function App(): React.ReactElement {
             <button className="mini-tool" onClick={reanalyzeCurrentBatch}>重跑分析</button>
           </div>
         )}
+
+        <div className="batch-list">
+          <div className="section-label">批次</div>
+          {batches.map((item, index) => (
+            <div key={item.id} className={`batch-item ${batch?.id === item.id ? 'active' : ''}`}>
+              <button className="batch-open" onClick={() => loadBatch(item.id)}>
+                <span>批次 {String(index + 1).padStart(2, '0')}</span>
+                <small>{item.name}</small>
+              </button>
+              <span className="batch-count">{item.totalPhotos}</span>
+              <button
+                className="batch-delete"
+                title="删除批次"
+                aria-label={`删除批次 ${item.name}`}
+                onClick={() => removeBatch(item.id, item.name)}
+              >
+                <Trash2 size={15} />
+              </button>
+            </div>
+          ))}
+        </div>
 
         {batch && (
           <div className="ai-buckets">
@@ -649,29 +719,9 @@ function App(): React.ReactElement {
             ))}
           </div>
         )}
-
-        <div className="batch-list">
-          <div className="section-label">批次</div>
-          {batches.map((item) => (
-            <div key={item.id} className={`batch-item ${batch?.id === item.id ? 'active' : ''}`}>
-              <button className="batch-open" onClick={() => loadBatch(item.id)}>
-                <span>{item.name}</span>
-                <small>{item.totalPhotos} photos</small>
-              </button>
-              <button
-                className="batch-delete"
-                title="删除批次"
-                aria-label={`删除批次 ${item.name}`}
-                onClick={() => removeBatch(item.id, item.name)}
-              >
-                <Trash2 size={15} />
-              </button>
-            </div>
-          ))}
-        </div>
       </aside>
 
-      <section className="workspace">
+      <section className={`workspace ${batch ? 'workspace-ready' : 'workspace-empty'}`}>
         <header className="topbar">
           <div>
             <h1>{batch ? `${activeBucket?.label || '语义搜索'} · ${visiblePhotos.length}` : '选择一个拍摄批次开始'}</h1>
@@ -679,13 +729,10 @@ function App(): React.ReactElement {
           </div>
           {batch && (
             <div className="toolbar">
-              <button className={mode === 'search' ? 'selected' : ''} onClick={() => { setMode('search'); setPhotoIndex(0); }}>
-                <Search size={16} /> 语义搜索
-              </button>
               <button className={debugMode ? 'selected' : ''} onClick={() => setDebugMode((value) => !value)}>
                 <ScanFace size={16} /> 调试框
               </button>
-              <button onClick={exportCsv}><Download size={16} /> CSV</button>
+              <button onClick={exportSelected}><Download size={16} /> 导出已选</button>
             </div>
           )}
         </header>
@@ -702,7 +749,14 @@ function App(): React.ReactElement {
                 onPointerMove={moveCanvasPan}
                 onPointerUp={stopCanvasPan}
                 onPointerCancel={stopCanvasPan}
-              >
+                >
+                {canvasPhoto && (
+                  <div className="canvas-hud">
+                    <span>{activeBucket?.label || '审片'}</span>
+                    <strong>{canvasPhoto.fileName}</strong>
+                    <em>{visiblePhotos.length ? `${canvasPhotoIndex >= 0 ? canvasPhotoIndex + 1 : Math.min(photoIndex + 1, visiblePhotos.length)} / ${visiblePhotos.length}` : '0 / 0'}</em>
+                  </div>
+                )}
                 {canvasPhoto?.previewPath ? (
                   <div
                     className="debug-image-wrap"
@@ -784,14 +838,7 @@ function App(): React.ReactElement {
                   <span>{activeBurstMeta.label} · 第 {activeBurstMeta.rank}/{activeBurstMeta.burstSize}</span>
                 </div>
               )}
-              {mode === 'search' && (
-                <div className="search-box">
-                  <input value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && runSearch()} placeholder="找新娘和父亲拥抱、舞台灯光、封面横构图..." />
-                  <button onClick={runSearch}><Search size={16} /></button>
-                </div>
-              )}
-
-              <PhotoPanel photo={activePhoto} onAnalyze={analyzeSemantic} onDecide={decide} />
+              <PhotoPanel photo={activePhoto} onDecide={decide} />
             </aside>
           </div>
         )}
@@ -869,19 +916,29 @@ function Metric({ label, value }: { label: string; value: number }): React.React
 
 function EmptyState({ onImportFolder, onImportArchive, disabled }: { onImportFolder: () => void; onImportArchive: () => void; disabled: boolean }): React.ReactElement {
   return (
-    <div className="empty">
-      <section className="import-card">
-        <div className="import-icon"><HardDrive size={26} /></div>
-        <span className="frame-kicker">New contact sheet</span>
-        <h2>让光线先沉淀下来</h2>
-        <p>导入一组照片，SenseFrame 会把重复、迟疑和失焦留在暗处。</p>
-        <div className="hero-actions">
-          <button className="import-button" onClick={onImportFolder} disabled={disabled}><FolderOpen size={18} /> 文件夹</button>
-          <button className="archive-button" onClick={onImportArchive} disabled={disabled}>RAR</button>
+    <div className="empty studio-empty">
+      <section className="studio-hero">
+        <div className="hero-copy">
+          <span className="frame-kicker">AI CONTACT SHEET</span>
+          <h2>把一整组照片摊在光桌上</h2>
+          <p>先看画面，再看风险。SenseFrame 会把近重复、眼部状态、主体问题和技术缺陷整理成摄影师能快速判断的工作台。</p>
+          <div className="hero-actions">
+            <button className="import-button" onClick={onImportFolder} disabled={disabled}><FolderOpen size={18} /> 导入文件夹</button>
+            <button className="archive-button" onClick={onImportArchive} disabled={disabled}>RAR</button>
+          </div>
+        </div>
+        <div className="light-table" aria-hidden="true">
+          <div className="contact-frame main-frame">
+            <span />
+            <i />
+          </div>
+          <div className="contact-frame side-frame one"><span /><i /></div>
+          <div className="contact-frame side-frame two"><span /><i /></div>
+          <div className="scan-line" />
         </div>
       </section>
 
-      <section className="readiness-grid">
+      <section className="readiness-grid studio-readiness">
         <div className="readiness-card">
           <ImageIcon size={20} />
           <span>显影</span>
@@ -931,9 +988,8 @@ function ImportOverlay({ progress }: { progress: ImportProgress }): React.ReactE
   );
 }
 
-function PhotoPanel({ photo, onAnalyze, onDecide }: { photo?: PhotoView; onAnalyze: () => void; onDecide: (decision: Decision, rating?: number) => void }): React.ReactElement {
+function PhotoPanel({ photo, onDecide }: { photo?: PhotoView; onDecide: (decision: Decision, rating?: number) => void }): React.ReactElement {
   if (!photo) return <div className="panel empty-panel">没有可显示的照片</div>;
-  const tags = [...(photo.semantic?.subjects || []), ...(photo.semantic?.emotion || []), ...(photo.semantic?.usage || [])];
   const eyeStateLabel = eyeStateText(photo.analysis?.eyeState);
   return (
     <div className="panel">
@@ -958,36 +1014,15 @@ function PhotoPanel({ photo, onAnalyze, onDecide }: { photo?: PhotoView; onAnaly
       </div>
 
       <div className="actions">
-        <button onClick={() => onDecide('pick')}><Check size={16} /> 保留</button>
-        <button onClick={() => onDecide('maybe')}><Eye size={16} /> 待定</button>
-        <button onClick={() => onDecide('reject')}><X size={16} /> 淘汰</button>
+        <button className={photo.decision === 'pick' ? 'selected pick-action' : 'pick-action'} onClick={() => onDecide('pick')} title="保留"><Check size={16} /><span>保留</span></button>
+        <button className={photo.decision === 'maybe' ? 'selected maybe-action' : 'maybe-action'} onClick={() => onDecide('maybe')} title="待定"><Eye size={16} /><span>待定</span></button>
+        <button className={photo.decision === 'reject' ? 'selected reject-action' : 'reject-action'} onClick={() => onDecide('reject')} title="淘汰"><X size={16} /><span>淘汰</span></button>
       </div>
 
       <div className="rating-row">
         {[1, 2, 3, 4, 5].map((star) => (
           <button key={star} onClick={() => onDecide('pick', star)} className={photo.rating && photo.rating >= star ? 'lit' : ''}><Star size={16} /></button>
         ))}
-      </div>
-
-      <div className="semantic">
-        <div className="semantic-head">
-          <h3><Brain size={16} /> 大模型增强</h3>
-          <button onClick={onAnalyze}><Sparkles size={15} /> 分析</button>
-        </div>
-        {photo.semantic ? (
-          <>
-            <p className="caption">{photo.semantic.caption}</p>
-            <p className="reason">{photo.semantic.recommendationReason}</p>
-            <div className="tag-row">{tags.map((tag) => <span key={tag}>{tag}</span>)}</div>
-            <div className="llm-scores">
-              <Score label="情绪" value={photo.semantic.llmScore.emotion} />
-              <Score label="故事" value={photo.semantic.llmScore.story} />
-              <Score label="封面" value={photo.semantic.llmScore.coverPotential} />
-            </div>
-          </>
-        ) : (
-          <p className="muted">点击分析，补充语义标签、推荐解释和搜索索引。</p>
-        )}
       </div>
     </div>
   );

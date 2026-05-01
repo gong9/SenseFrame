@@ -19,6 +19,7 @@ const api = {
   analyzeSemantic: (payload: { batchId: string; photoId: string }): Promise<SemanticAnalysis> => ipcRenderer.invoke('ai:analyzeSemantic', payload),
   search: (payload: { batchId: string; query: string }): Promise<SearchResult[]> => ipcRenderer.invoke('ai:search', payload),
   exportCsv: (batchId: string): Promise<string> => ipcRenderer.invoke('export:csv', batchId),
+  exportSelected: (batchId: string): Promise<{ dir: string; count: number } | null> => ipcRenderer.invoke('export:selected', batchId),
   workerHint: (): Promise<string> => ipcRenderer.invoke('system:workerHint'),
   fileUrl: (path?: string): string => (path ? `senseframe://image?path=${encodeURIComponent(path)}` : '')
 };

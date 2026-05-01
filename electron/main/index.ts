@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, protocol } from 'electron';
-import { join } from 'node:path';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { basename, extname, join } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { is } from '@electron-toolkit/utils';
 import { loadLocalEnv } from './env';
 import { analyzeSemantic, semanticSearch } from './openaiService';
@@ -105,6 +105,39 @@ app.whenReady().then(() => {
     const path = join(dir, `${batch.name}-${new Date().toISOString().slice(0, 10)}.csv`);
     writeFileSync(path, csv, 'utf8');
     return path;
+  });
+  ipcMain.handle('export:selected', async (_event, batchId: string) => {
+    const batch = getBatch(batchId);
+    const picked = batch.photos.filter((photo) => photo.decision === 'pick');
+    if (!picked.length) return null;
+
+    const focused = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+    const result = await dialog.showOpenDialog({
+      ...(focused ? { window: focused } : {}),
+      properties: ['openDirectory', 'createDirectory', 'dontAddToRecent'],
+      title: '选择导出已选照片的位置'
+    } as Electron.OpenDialogOptions);
+    if (result.canceled || !result.filePaths[0]) return null;
+
+    const safeBatchName = batch.name.replace(/[\\/:*?"<>|]/g, '_');
+    const exportDir = join(result.filePaths[0], `${safeBatchName}-selected`);
+    mkdirSync(exportDir, { recursive: true });
+
+    picked.forEach((photo, index) => {
+      const sourceName = basename(photo.filePath);
+      const ext = extname(sourceName);
+      const stem = ext ? sourceName.slice(0, -ext.length) : sourceName;
+      let target = join(exportDir, sourceName);
+      let suffix = 1;
+      while (existsSync(target)) {
+        target = join(exportDir, `${stem}-${suffix}${ext}`);
+        suffix += 1;
+      }
+      copyFileSync(photo.filePath, target);
+      if ((index + 1) % 25 === 0) console.log(`[SenseFrame] exported ${index + 1}/${picked.length} selected photos`);
+    });
+
+    return { dir: exportDir, count: picked.length };
   });
 
   createWindow();
