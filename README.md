@@ -1,6 +1,6 @@
 # SenseFrame
 
-![SenseFrame desktop review workspace](docs/assets/senseframe-main.png)
+![SenseFrame desktop review workspace](docs/assets/senseframe-main-2026-05-02.png)
 
 SenseFrame is an offline-first desktop photo culling app for photographers. It imports local folders or RAR archives, builds previews, analyzes technical quality, detects face and eye state, groups near duplicates and similar bursts, then lets the reviewer keep, reject, star, search, and export decisions.
 
