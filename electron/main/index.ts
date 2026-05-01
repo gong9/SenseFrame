@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { is } from '@electron-toolkit/utils';
 import { loadLocalEnv } from './env';
 import { analyzeSemantic, semanticSearch } from './openaiService';
-import { deleteBatch, getBatch, importSource, listBatches, rebuildClusters, saveDecision, workerHint } from './photoPipeline';
+import { deleteBatch, getBatch, importSource, listBatches, reanalyzeBatch, rebuildClusters, saveDecision, workerHint } from './photoPipeline';
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -73,6 +73,7 @@ app.whenReady().then(() => {
   ipcMain.handle('library:listBatches', async () => listBatches());
   ipcMain.handle('library:getBatch', async (_event, batchId: string) => getBatch(batchId));
   ipcMain.handle('library:rebuildClusters', async (_event, batchId: string) => rebuildClusters(batchId));
+  ipcMain.handle('library:reanalyzeBatch', async (_event, batchId: string) => reanalyzeBatch(batchId));
   ipcMain.handle('library:deleteBatch', async (_event, payload: { batchId: string; deleteOriginals?: boolean }) => {
     return deleteBatch(payload.batchId, Boolean(payload.deleteOriginals));
   });

@@ -252,15 +252,32 @@ button:disabled {
 .image-stage {
   position: absolute; inset: 16px 20px 108px; min-height: 0; overflow: hidden; display: grid; place-items: center;
   background: #050605; border: 1px solid rgba(255,255,255,0.08);
+  cursor: default;
+  user-select: none;
 }
-.image-stage img { max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; display: block; }
-.debug-image-wrap {
-  position: relative;
-  display: grid;
-  place-items: center;
+.image-stage.zoomed {
+  overflow: hidden;
+  cursor: grab;
+}
+.image-stage.zoomed:active {
+  cursor: grabbing;
+}
+.image-stage img {
+  display: block;
   width: 100%;
   height: 100%;
-  min-height: 0;
+  object-fit: fill;
+  pointer-events: none;
+}
+.debug-image-wrap {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  max-width: calc(100% - 32px);
+  max-height: calc(100% - 32px);
+  transform-origin: center center;
+  transition: transform 120ms ease;
+  will-change: transform;
 }
 .debug-overlay {
   position: absolute;
@@ -304,6 +321,40 @@ button:disabled {
   padding: 6px 8px;
   color: #d8d1c2;
   font-size: 12px;
+}
+.zoom-controls {
+  position: absolute;
+  left: 16px;
+  bottom: 16px;
+  z-index: 4;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  background: rgba(8,8,7,0.82);
+  border: 1px solid rgba(220,213,198,0.16);
+  backdrop-filter: blur(12px);
+}
+.zoom-controls button {
+  min-width: 34px;
+  min-height: 32px;
+  border: 1px solid rgba(220, 213, 198, 0.13);
+  background: #121413;
+  color: #d8d1c2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 9px;
+}
+.zoom-controls button.selected {
+  background: #1b211f;
+  border-color: rgba(111, 162, 155, 0.58);
+  color: #e8f4f1;
+}
+.zoom-controls .zoom-value {
+  min-width: 56px;
+  cursor: default;
+  color: #a9a295;
 }
 .missing-preview {
   display: grid; place-items: center; gap: 12px; text-align: center; color: #8c887d;

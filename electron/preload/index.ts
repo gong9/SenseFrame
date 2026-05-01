@@ -13,6 +13,7 @@ const api = {
   listBatches: (): Promise<Array<{ id: string; name: string; status: string; totalPhotos: number; createdAt: string }>> => ipcRenderer.invoke('library:listBatches'),
   getBatch: (batchId: string): Promise<BatchView> => ipcRenderer.invoke('library:getBatch', batchId),
   rebuildClusters: (batchId: string): Promise<BatchView> => ipcRenderer.invoke('library:rebuildClusters', batchId),
+  reanalyzeBatch: (batchId: string): Promise<BatchView> => ipcRenderer.invoke('library:reanalyzeBatch', batchId),
   deleteBatch: (payload: { batchId: string; deleteOriginals?: boolean }): Promise<DeleteBatchResult> => ipcRenderer.invoke('library:deleteBatch', payload),
   saveDecision: (payload: { photoId: string; batchId: string; decision: string; rating?: number }): Promise<boolean> => ipcRenderer.invoke('library:saveDecision', payload),
   analyzeSemantic: (payload: { batchId: string; photoId: string }): Promise<SemanticAnalysis> => ipcRenderer.invoke('ai:analyzeSemantic', payload),

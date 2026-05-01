@@ -31,6 +31,7 @@ const IMAGE_EXTS = new Set([
 const RAW_EXTS = new Set(['.arw', '.cr2', '.cr3', '.nef', '.raf', '.dng', '.orf', '.rw2', '.pef', '.srw']);
 const HEIC_EXTS = new Set(['.heic', '.heif']);
 const ARCHIVE_EXTS = new Set(['.rar']);
+const DIRECT_ANALYSIS_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
 
 function eyesOpenScoreFromState(state: EyeState): number {
   if (state === 'open') return 1;
@@ -152,8 +153,15 @@ async function createPreview(filePath: string, previewPath: string, thumbPath: s
 
 async function analyzePhoto(filePath: string, photoId: string, previewPath?: string, baseFlags: RiskFlag[] = []): Promise<PhotoAnalysis> {
   try {
-    const source = previewPath && existsSync(previewPath) ? previewPath : filePath;
-    const result = normalizeAnalysis(await analyzeWithPython(source));
+    const ext = extname(filePath).toLowerCase();
+    const preferredSource = DIRECT_ANALYSIS_EXTS.has(ext) && existsSync(filePath) ? filePath : previewPath && existsSync(previewPath) ? previewPath : filePath;
+    let result: Omit<PhotoAnalysis, 'photoId'>;
+    try {
+      result = normalizeAnalysis(await analyzeWithPython(preferredSource));
+    } catch (error) {
+      if (!previewPath || preferredSource === previewPath || !existsSync(previewPath)) throw error;
+      result = normalizeAnalysis(await analyzeWithPython(previewPath));
+    }
     return {
       photoId,
       ...result,
@@ -215,6 +223,38 @@ async function analyzePhoto(filePath: string, photoId: string, previewPath?: str
       riskFlags: Array.from(new Set(baseFlags))
     };
   }
+}
+
+function saveAnalysis(photoId: string, analysis: PhotoAnalysis): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT OR REPLACE INTO photo_analysis (
+      photo_id, sharpness_score, exposure_score, highlight_clip_ratio, shadow_clip_ratio,
+      face_score, eyes_open_score, face_count, final_score, risk_flags,
+      face_visibility, eye_state, eye_confidence, left_eye_state, right_eye_state,
+      debug_regions,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    photoId,
+    analysis.sharpnessScore,
+    analysis.exposureScore,
+    analysis.highlightClipRatio,
+    analysis.shadowClipRatio,
+    analysis.faceScore,
+    analysis.eyesOpenScore,
+    analysis.faceCount,
+    analysis.finalScore,
+    JSON.stringify(analysis.riskFlags),
+    analysis.faceVisibility,
+    analysis.eyeState,
+    analysis.eyeConfidence,
+    analysis.leftEyeState,
+    analysis.rightEyeState,
+    JSON.stringify(analysis.debugRegions),
+    now(),
+    now()
+  );
 }
 
 async function hashPreview(previewPath?: string): Promise<string> {
@@ -291,7 +331,7 @@ async function buildClusters(batchId: string, photos: PhotoView[]): Promise<Clus
     const ranked = [...group].sort((a, b) => adjustedScore(b) - adjustedScore(a));
     const best = ranked[0];
     const size = ranked.length;
-    const recommendCount = size > 8 ? 3 : size > 3 ? 2 : 1;
+    const recommendCount = size === 1 ? 0 : size > 8 ? 3 : size > 3 ? 2 : 1;
     const clusterId = `${batchId}-c${String(index).padStart(3, '0')}`;
     clusters.push({
       id: clusterId,
@@ -373,34 +413,7 @@ export async function importFolder(rootPath: string, onProgress?: (progress: Imp
       now()
     );
 
-    db.prepare(`
-      INSERT OR REPLACE INTO photo_analysis (
-        photo_id, sharpness_score, exposure_score, highlight_clip_ratio, shadow_clip_ratio,
-        face_score, eyes_open_score, face_count, final_score, risk_flags,
-        face_visibility, eye_state, eye_confidence, left_eye_state, right_eye_state,
-        debug_regions,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      photoId,
-      analysis.sharpnessScore,
-      analysis.exposureScore,
-      analysis.highlightClipRatio,
-      analysis.shadowClipRatio,
-      analysis.faceScore,
-      analysis.eyesOpenScore,
-      analysis.faceCount,
-      analysis.finalScore,
-      JSON.stringify(analysis.riskFlags),
-      analysis.faceVisibility,
-      analysis.eyeState,
-      analysis.eyeConfidence,
-      analysis.leftEyeState,
-      analysis.rightEyeState,
-      JSON.stringify(analysis.debugRegions),
-      now(),
-      now()
-    );
+    saveAnalysis(photoId, analysis);
   }
 
   onProgress?.({ stage: 'clustering', message: '正在分组相似照片...', current: files.length, total: files.length });
@@ -410,6 +423,33 @@ export async function importFolder(rootPath: string, onProgress?: (progress: Imp
   db.prepare('UPDATE batches SET status = ?, total_photos = ?, processed_photos = ?, updated_at = ? WHERE id = ?').run('ready', files.length, files.length, now(), batchId);
   onProgress?.({ stage: 'done', message: '导入完成', current: files.length, total: files.length });
   return { batchId, imported: files.length, unsupported };
+}
+
+export async function reanalyzeBatch(batchId: string): Promise<BatchView> {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT id, file_path as filePath, preview_path as previewPath, status
+    FROM photos
+    WHERE batch_id = ?
+    ORDER BY COALESCE(shot_at, file_name)
+  `).all(batchId) as Array<{ id: string; filePath: string; previewPath?: string; status: string }>;
+
+  for (const row of rows) {
+    const baseFlags: RiskFlag[] = row.status === 'ready'
+      ? []
+      : row.status.startsWith('raw_decode_failed')
+        ? ['raw_decode_failed']
+        : row.status.startsWith('heic_decode_failed')
+          ? ['heic_decode_failed']
+          : ['unsupported_preview'];
+    const analysis = await analyzePhoto(row.filePath, row.id, row.previewPath || undefined, baseFlags);
+    saveAnalysis(row.id, analysis);
+  }
+
+  const view = getBatch(batchId);
+  saveClusters(batchId, await buildClusters(batchId, view.photos));
+  db.prepare('UPDATE batches SET processed_photos = ?, updated_at = ? WHERE id = ?').run(rows.length, now(), batchId);
+  return getBatch(batchId);
 }
 
 export async function importSource(sourcePath: string, onProgress?: (progress: ImportProgress) => void): Promise<ImportResult> {

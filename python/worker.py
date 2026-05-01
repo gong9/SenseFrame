@@ -6,7 +6,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 try:
     import onnxruntime as ort
@@ -69,7 +69,7 @@ def decode_image(input_path):
     ext = Path(input_path).suffix.lower()
     if ext in RAW_EXTS:
         return decode_raw(input_path)
-    pil = Image.open(input_path).convert("RGB")
+    pil = ImageOps.exif_transpose(Image.open(input_path)).convert("RGB")
     return np.array(pil)
 
 
@@ -407,7 +407,8 @@ def preprocess_eye(crop, session):
         else:
             height = int(shape[1] or height)
             width = int(shape[2] or width)
-    resized = cv2.resize(crop, (width, height), interpolation=cv2.INTER_AREA)
+    interpolation = cv2.INTER_CUBIC if crop.shape[0] < height or crop.shape[1] < width else cv2.INTER_AREA
+    resized = cv2.resize(crop, (width, height), interpolation=interpolation)
     normalized = resized.astype(np.float32) / 255.0
     if len(shape) == 4 and shape[1] in (1, 3):
         if shape[1] == 3:
@@ -795,7 +796,7 @@ def build_debug_regions(faces, eye_crops, image_width, image_height):
 
 def analyze(args):
     image = decode_image(args.input)
-    max_side = 2400
+    max_side = 4096
     h, w = image.shape[:2]
     scale = min(1.0, max_side / max(h, w))
     if scale < 1.0:

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   Aperture,
@@ -17,7 +17,9 @@ import {
   Star,
   Trash2,
   TriangleAlert,
-  X
+  X,
+  ZoomIn,
+  ZoomOut
 } from 'lucide-react';
 import type { BatchView, Cluster, Decision, ImportProgress, PhotoView, SearchResult } from '../electron/shared/types';
 import './styles.css';
@@ -140,6 +142,80 @@ function clusterMetaByPhoto(batch: BatchView): Map<string, ClusterMeta> {
   return meta;
 }
 
+function reviewScore(photo: PhotoView): number {
+  const analysis = photo.analysis;
+  const flags = new Set<string>(analysis?.riskFlags || []);
+  let score = analysis?.finalScore ?? 0;
+  if (flags.has('closed_eyes')) score -= 0.28;
+  if (flags.has('eyes_uncertain')) score -= 0.08;
+  if (flags.has('subject_cropped') || flags.has('subject_cropped_severe')) score -= 0.22;
+  if (flags.has('subject_cropped_mild')) score -= 0.08;
+  if (flags.has('weak_subject')) score -= 0.14;
+  if (flags.has('possible_blur')) score -= 0.16;
+  if (flags.has('bad_exposure')) score -= 0.12;
+  if (flags.has('face_blur')) score -= 0.08;
+  if (analysis?.eyeState === 'open') score += 0.04;
+  if (analysis?.eyeState === 'closed') score -= 0.24;
+  if (analysis?.eyeState === 'uncertain') score -= 0.07;
+  if (analysis?.faceVisibility === 'visible') score += 0.03;
+  if (photo.decision === 'pick') score += 0.18;
+  if (photo.decision === 'reject') score -= 0.4;
+  if (photo.rating) score += Math.min(0.14, photo.rating * 0.025);
+  return Math.max(0, Math.min(1, score));
+}
+
+function canFeature(photo: PhotoView): boolean {
+  const flags = new Set<string>(photo.analysis?.riskFlags || []);
+  if (photo.status !== 'ready') return false;
+  if (flags.has('unsupported_preview') || flags.has('raw_decode_failed') || flags.has('heic_decode_failed')) return false;
+  if (flags.has('closed_eyes') || photo.analysis?.eyeState === 'closed') return false;
+  if (photo.decision === 'reject') return false;
+  return reviewScore(photo) >= 0.58;
+}
+
+function featuredPhotoIds(batch: BatchView, burstMeta: Map<string, BurstMeta>, clusterMeta: Map<string, ClusterMeta>): Set<string> {
+  const selected = new Set<string>();
+  const selectedClusters = new Set<number>();
+  const byBurst = new Map<number, PhotoView[]>();
+
+  for (const photo of batch.photos) {
+    const burst = burstMeta.get(photo.id);
+    if (!burst) continue;
+    byBurst.set(burst.burstNumber, [...(byBurst.get(burst.burstNumber) || []), photo]);
+  }
+
+  const addBest = (photos: PhotoView[], quota: number, requireStrong = false) => {
+    const ranked = [...photos]
+      .filter((photo) => canFeature(photo) && (!requireStrong || reviewScore(photo) >= 0.7))
+      .sort((a, b) => reviewScore(b) - reviewScore(a));
+    for (const photo of ranked) {
+      if (selected.size >= batch.photos.length) break;
+      const cluster = clusterMeta.get(photo.id);
+      if (cluster && cluster.rank > 1) continue;
+      if (cluster && selectedClusters.has(cluster.clusterNumber)) continue;
+      selected.add(photo.id);
+      if (cluster) selectedClusters.add(cluster.clusterNumber);
+      if ([...selected].filter((id) => photos.some((photo) => photo.id === id)).length >= quota) break;
+    }
+  };
+
+  for (const photos of byBurst.values()) {
+    const quota = Math.min(4, Math.max(1, Math.ceil(photos.length * 0.16)));
+    addBest(photos, quota);
+  }
+
+  const nonBurst = batch.photos.filter((photo) => !burstMeta.has(photo.id));
+  if (nonBurst.length) {
+    addBest(nonBurst, Math.min(12, Math.max(3, Math.ceil(nonBurst.length * 0.15))), true);
+  }
+
+  if (!selected.size) {
+    addBest(batch.photos, Math.min(12, Math.max(1, Math.ceil(batch.photos.length * 0.12))));
+  }
+
+  return selected;
+}
+
 function App(): React.ReactElement {
   const [batches, setBatches] = useState<Array<{ id: string; name: string; status: string; totalPhotos: number; createdAt: string }>>([]);
   const [batch, setBatch] = useState<BatchView | null>(null);
@@ -152,6 +228,13 @@ function App(): React.ReactElement {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);
   const [debugMode, setDebugMode] = useState(false);
+  const [canvasPhoto, setCanvasPhoto] = useState<PhotoView | undefined>(undefined);
+  const [imageZoom, setImageZoom] = useState(1);
+  const [imagePan, setImagePan] = useState({ x: 0, y: 0 });
+  const dragRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
+  const [imageSize, setImageSize] = useState({ width: 0, height: 0 });
 
   async function refreshBatches(): Promise<void> {
     if (!window.senseframe) return;
@@ -201,6 +284,19 @@ function App(): React.ReactElement {
     }
   }
 
+  async function reanalyzeCurrentBatch(): Promise<void> {
+    if (!batch || !window.senseframe) return;
+    setBusy('正在用原图重跑人脸与眼部分析...');
+    try {
+      const next = await window.senseframe.reanalyzeBatch(batch.id);
+      setBatch(next);
+      setPhotoIndex(0);
+      setNotice('已用原图重跑人脸与眼部分析。');
+    } finally {
+      setBusy('');
+    }
+  }
+
   useEffect(() => {
     refreshBatches().then(() => undefined);
     if (!window.senseframe) return;
@@ -213,14 +309,15 @@ function App(): React.ReactElement {
   const duplicateIds = useMemo(() => (batch ? duplicatePhotoIds(batch) : new Set<string>()), [batch]);
   const clusterMeta = useMemo(() => (batch ? clusterMetaByPhoto(batch) : new Map<string, ClusterMeta>()), [batch]);
   const burstMeta = useMemo(() => (batch ? similarBurstMetaByPhoto(batch) : new Map<string, BurstMeta>()), [batch]);
+  const featuredIds = useMemo(() => (batch ? featuredPhotoIds(batch, burstMeta, clusterMeta) : new Set<string>()), [batch, burstMeta, clusterMeta]);
   const bucketDefs = useMemo(() => {
     if (!batch) return [];
     const buckets: Array<{ id: ViewMode; label: string; description: string; count: number; icon: React.ReactNode }> = [
       {
         id: 'featured',
         label: '精选候选',
-        description: '组内优先看的照片',
-        count: batch.photos.filter((photo) => photo.recommended).length,
+        description: '每段优先看的照片',
+        count: featuredIds.size,
         icon: <Sparkles size={16} />
       },
       {
@@ -271,18 +368,18 @@ function App(): React.ReactElement {
         description: 'AI 不确定，建议人工看',
         count: batch.photos.filter((photo) => {
           const flags = photo.analysis?.riskFlags || [];
-          return photo.analysis?.eyeState === 'uncertain' || photo.analysis?.faceVisibility === 'unknown' || (flags.length > 0 && !photo.recommended);
+          return photo.analysis?.eyeState === 'uncertain' || photo.analysis?.faceVisibility === 'unknown' || (flags.length > 0 && !featuredIds.has(photo.id));
         }).length,
         icon: <Brain size={16} />
       }
     ];
     return buckets;
-  }, [batch, duplicateIds, burstMeta]);
+  }, [batch, duplicateIds, burstMeta, featuredIds]);
   const activeBucket = bucketDefs.find((bucket) => bucket.id === mode);
   const visiblePhotos = useMemo(() => {
     if (!batch) return [];
     if (mode === 'search') return results.map((item) => item.photo);
-    if (mode === 'featured') return batch.photos.filter((photo) => photo.recommended);
+    if (mode === 'featured') return batch.photos.filter((photo) => featuredIds.has(photo.id)).sort((a, b) => reviewScore(b) - reviewScore(a));
     if (mode === 'closedEyes') return batch.photos.filter((photo) => hasAnyFlag(photo, closedEyeFlags));
     if (mode === 'eyeReview') return batch.photos.filter((photo) => hasAnyFlag(photo, eyeReviewFlags));
     if (mode === 'subject') return batch.photos.filter((photo) => hasAnyFlag(photo, subjectFlags));
@@ -304,23 +401,81 @@ function App(): React.ReactElement {
     }
     if (mode === 'pending') return batch.photos.filter((photo) => {
       const flags = photo.analysis?.riskFlags || [];
-      return photo.analysis?.eyeState === 'uncertain' || photo.analysis?.faceVisibility === 'unknown' || (flags.length > 0 && !photo.recommended);
+      return photo.analysis?.eyeState === 'uncertain' || photo.analysis?.faceVisibility === 'unknown' || (flags.length > 0 && !featuredIds.has(photo.id));
     });
     return [];
-  }, [batch, mode, results, duplicateIds, burstMeta]);
+  }, [batch, mode, results, duplicateIds, burstMeta, featuredIds]);
   const activePhoto = visiblePhotos[Math.min(photoIndex, Math.max(visiblePhotos.length - 1, 0))];
   const activeClusterMeta = activePhoto ? clusterMeta.get(activePhoto.id) : undefined;
   const activeBurstMeta = activePhoto ? burstMeta.get(activePhoto.id) : undefined;
+  const isFitZoom = imageZoom === 1;
+
+  useEffect(() => {
+    setImageZoom(1);
+    setImagePan({ x: 0, y: 0 });
+    setImageSize({
+      width: activePhoto?.width || 0,
+      height: activePhoto?.height || 0
+    });
+
+    if (!activePhoto?.previewPath || !window.senseframe) {
+      setCanvasPhoto(activePhoto);
+      return;
+    }
+
+    let cancelled = false;
+    const loader = new window.Image();
+    loader.onload = () => {
+      if (cancelled) return;
+      setCanvasPhoto(activePhoto);
+      setImageSize({
+        width: loader.naturalWidth || activePhoto.width || 0,
+        height: loader.naturalHeight || activePhoto.height || 0
+      });
+    };
+    loader.onerror = () => {
+      if (!cancelled) setCanvasPhoto(activePhoto);
+    };
+    loader.src = window.senseframe.fileUrl(activePhoto.previewPath);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activePhoto?.id]);
+
+  useEffect(() => {
+    const element = stageRef.current;
+    if (!element) return;
+    const update = () => {
+      const rect = element.getBoundingClientRect();
+      setStageSize({ width: rect.width, height: rect.height });
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [batch?.id, activePhoto?.id]);
+
+  const fittedImageSize = useMemo(() => {
+    if (!stageSize.width || !stageSize.height || !imageSize.width || !imageSize.height) return null;
+    const safeWidth = Math.max(120, stageSize.width - 32);
+    const safeHeight = Math.max(120, stageSize.height - 32);
+    const scale = Math.min(safeWidth / imageSize.width, safeHeight / imageSize.height);
+    return {
+      width: Math.max(1, imageSize.width * scale),
+      height: Math.max(1, imageSize.height * scale)
+    };
+  }, [stageSize, imageSize]);
 
   const stats = useMemo(() => {
     if (!batch) return { candidates: 0, review: 0, picked: 0, rejected: 0 };
     return {
-      candidates: batch.photos.filter((photo) => photo.recommended).length,
+      candidates: featuredIds.size,
       review: batch.photos.filter((photo) => photo.analysis?.riskFlags.length || photo.status !== 'ready').length,
       picked: batch.photos.filter((photo) => photo.decision === 'pick').length,
       rejected: batch.photos.filter((photo) => photo.decision === 'reject').length
     };
-  }, [batch]);
+  }, [batch, featuredIds]);
 
   async function importSource(kind: 'folder' | 'archive' = 'folder'): Promise<void> {
     if (importProgress) return;
@@ -355,6 +510,30 @@ function App(): React.ReactElement {
       setBusy('');
       setImportProgress(null);
     }
+  }
+
+  function setZoom(next: number): void {
+    const zoom = Math.max(1, Math.min(4, next));
+    setImageZoom(zoom);
+    if (zoom === 1) setImagePan({ x: 0, y: 0 });
+  }
+
+  function startCanvasPan(event: React.PointerEvent<HTMLDivElement>): void {
+    if (imageZoom === 1) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragRef.current = { x: event.clientX, y: event.clientY, panX: imagePan.x, panY: imagePan.y };
+  }
+
+  function moveCanvasPan(event: React.PointerEvent<HTMLDivElement>): void {
+    if (!dragRef.current) return;
+    setImagePan({
+      x: dragRef.current.panX + event.clientX - dragRef.current.x,
+      y: dragRef.current.panY + event.clientY - dragRef.current.y
+    });
+  }
+
+  function stopCanvasPan(): void {
+    dragRef.current = null;
   }
 
   async function decide(decision: Decision, rating?: number): Promise<void> {
@@ -444,6 +623,7 @@ function App(): React.ReactElement {
             <Metric label="复核" value={stats.review} />
             <Metric label="已选" value={stats.picked} />
             <button className="mini-tool" onClick={rebuildCurrentClusters}>重建近重复</button>
+            <button className="mini-tool" onClick={reanalyzeCurrentBatch}>重跑分析</button>
           </div>
         )}
 
@@ -515,11 +695,32 @@ function App(): React.ReactElement {
         ) : (
           <div className="main-grid">
             <section className="viewer">
-              <div className="image-stage">
-                {activePhoto?.previewPath ? (
-                  <div className="debug-image-wrap">
-                    <img src={window.senseframe?.fileUrl(activePhoto.previewPath)} alt={activePhoto.fileName} />
-                    {debugMode && <DebugOverlay photo={activePhoto} />}
+              <div
+                ref={stageRef}
+                className={`image-stage ${isFitZoom ? 'fit' : 'zoomed'}`}
+                onPointerDown={startCanvasPan}
+                onPointerMove={moveCanvasPan}
+                onPointerUp={stopCanvasPan}
+                onPointerCancel={stopCanvasPan}
+              >
+                {canvasPhoto?.previewPath ? (
+                  <div
+                    className="debug-image-wrap"
+                    style={{
+                      width: fittedImageSize ? `${fittedImageSize.width}px` : undefined,
+                      height: fittedImageSize ? `${fittedImageSize.height}px` : undefined,
+                      transform: `translate(${imagePan.x}px, ${imagePan.y}px) scale(${imageZoom})`
+                    }}
+                  >
+                    <img
+                      src={window.senseframe?.fileUrl(canvasPhoto.previewPath)}
+                      alt={canvasPhoto.fileName}
+                      onLoad={(event) => setImageSize({
+                        width: event.currentTarget.naturalWidth,
+                        height: event.currentTarget.naturalHeight
+                      })}
+                    />
+                    {debugMode && <DebugOverlay photo={canvasPhoto} />}
                   </div>
                 ) : visiblePhotos.length === 0 ? (
                   <div className="missing-preview"><Layers size={46} />当前分组没有照片</div>
@@ -527,15 +728,28 @@ function App(): React.ReactElement {
                   <div className="missing-preview"><ImageIcon size={46} />预览不可用</div>
                 )}
                 {busy && <div className="busy"><Loader2 className="spin" size={18} /> {busy}</div>}
+                {activePhoto?.previewPath && (
+                  <div className="zoom-controls" aria-label="图片缩放" onPointerDown={(event) => event.stopPropagation()}>
+                    <button title="缩小" onClick={() => setZoom(imageZoom - 0.25)}>
+                      <ZoomOut size={16} />
+                    </button>
+                    <button className={isFitZoom ? 'selected' : ''} onClick={() => { setImageZoom(1); setImagePan({ x: 0, y: 0 }); }}>适屏</button>
+                    <button className="zoom-value">{Math.round(imageZoom * 100)}%</button>
+                    <button title="放大" onClick={() => setZoom(imageZoom + 0.25)}>
+                      <ZoomIn size={16} />
+                    </button>
+                  </div>
+                )}
               </div>
               <div className="filmstrip">
                 {visiblePhotos.map((photo, index) => {
                   const meta = clusterMeta.get(photo.id);
                   const burst = burstMeta.get(photo.id);
+                  const featured = featuredIds.has(photo.id);
                   return (
                     <button
                       key={photo.id}
-                      className={`thumb ${index === photoIndex ? 'active' : ''} ${photo.decision} ${meta || burst ? 'clustered' : ''} ${meta?.recommended ? 'cluster-best' : ''}`}
+                      className={`thumb ${index === photoIndex ? 'active' : ''} ${photo.decision} ${meta || burst ? 'clustered' : ''} ${featured ? 'cluster-best' : ''}`}
                       title={
                         meta
                           ? `近重复 G${meta.clusterNumber} · 第 ${meta.rank}/${meta.clusterSize} · 相似 ${pct(meta.similarityToBest)}`
@@ -550,7 +764,7 @@ function App(): React.ReactElement {
                       {!meta && burst && <span className="cluster-badge burst">B{burst.burstNumber}</span>}
                       {meta && <span className="rank-badge">{meta.rank}/{meta.clusterSize}</span>}
                       {!meta && burst && <span className="rank-badge">{burst.rank}/{burst.burstSize}</span>}
-                      {photo.recommended && <span className="badge">推荐</span>}
+                      {featured && <span className="badge">精选</span>}
                     </button>
                   );
                 })}
