@@ -15,6 +15,96 @@ function summarize(value: unknown, limit = 30000): string {
   return text.length > limit ? `${text.slice(0, limit)}\n...<truncated>` : text;
 }
 
+function compactReview(review: any): Record<string, unknown> {
+  return {
+    photoId: review?.photoId,
+    primaryBucket: review?.primaryBucket,
+    confidence: review?.confidence,
+    recommendedAction: review?.recommendedAction,
+    needsHumanReview: review?.needsHumanReview,
+    reviewSource: review?.reviewSource,
+    sheetId: review?.sheetId,
+    sheetCell: review?.sheetCell,
+    visualScores: review?.visualScores,
+    aestheticPass: review?.aestheticPass,
+    fatalFlaws: review?.fatalFlaws,
+    reason: typeof review?.reason === 'string' ? review.reason.slice(0, 260) : review?.reason
+  };
+}
+
+function compactToolOutput(toolName: string, output: any): unknown {
+  if (toolName === 'GetBatchOverview') {
+    const photos = Array.isArray(output?.photos) ? output.photos : [];
+    return {
+      batch: output?.batch,
+      groups: output?.groups,
+      photos: photos.map((photo: any) => ({
+        id: photo.id,
+        fileName: photo.fileName,
+        decision: photo.decision,
+        rating: photo.rating,
+        clusterId: photo.clusterId,
+        rankInCluster: photo.rankInCluster,
+        recommended: photo.recommended,
+        analysis: photo.analysis,
+        brainReview: photo.brainReview ? {
+          primaryBucket: photo.brainReview.primaryBucket,
+          confidence: photo.brainReview.confidence,
+          recommendedAction: photo.brainReview.recommendedAction,
+          needsHumanReview: photo.brainReview.needsHumanReview,
+          visualScores: photo.brainReview.visualScores,
+          aestheticPass: photo.brainReview.aestheticPass,
+          fatalFlaws: photo.brainReview.fatalFlaws,
+          groupId: photo.brainReview.groupId,
+          groupRank: photo.brainReview.groupRank,
+          reason: typeof photo.brainReview.reason === 'string' ? photo.brainReview.reason.slice(0, 180) : photo.brainReview.reason
+        } : undefined
+      }))
+    };
+  }
+  if (toolName === 'ReviewContactSheetWithVision') {
+    return {
+      sheetId: output?.sheetId,
+      sheetSummary: output?.sheetSummary,
+      reviews: Array.isArray(output?.reviews) ? output.reviews.map(compactReview) : [],
+      singleVisionPhotoIds: output?.singleVisionPhotoIds,
+      cacheHit: output?.cacheHit
+    };
+  }
+  if (toolName === 'ReviewPhotoWithVision') {
+    return {
+      review: compactReview(output?.review),
+      cacheHit: output?.cacheHit
+    };
+  }
+  if (toolName === 'CompareSimilarGroupWithVision') {
+    return output?.groupReview ? {
+      groupReview: {
+        groupId: output.groupReview.groupId,
+        representativePhotoId: output.groupReview.representativePhotoId,
+        rankedPhotoIds: output.groupReview.rankedPhotoIds,
+        groupReason: typeof output.groupReview.groupReason === 'string' ? output.groupReview.groupReason.slice(0, 320) : output.groupReview.groupReason,
+        roles: output.groupReview.roles
+      }
+    } : output;
+  }
+  if (toolName === 'WriteBrainReviewResult') {
+    return {
+      runId: output?.runId,
+      status: output?.status,
+      reviewed: output?.reviewed,
+      summary: output?.summary,
+      bucketCounts: output?.bucketCounts,
+      groupReviewCount: output?.groupReviewCount
+    };
+  }
+  return output;
+}
+
+function summarizeToolOutput(toolName: string, output: any): string {
+  return summarize(compactToolOutput(toolName, output), 12000);
+}
+
 function asToolDefinitions(tools: BrainToolDefinition[]): Record<string, unknown>[] {
   return tools.map((tool) => ({
     type: 'function',
@@ -30,6 +120,7 @@ function toolsForMode(mode: BrainRuntimeRequest['mode'], tools: BrainToolDefinit
   if (mode !== 'review') return tools;
   const reviewTools = new Set([
     'GetBatchOverview',
+    'GetVisionRuntimeStatus',
     'DecideReviewStrategy',
     'CreateReviewContactSheets',
     'ReviewContactSheetWithVision',
@@ -57,6 +148,7 @@ function systemPrompt(mode: BrainRuntimeRequest['mode']): string {
           'GetBatchOverview 里的 brainRun/brainReview 只是历史审片结果，不能视为本次审片已经完成，不能沿用旧结果跳过本次全量视觉覆盖。',
           '本次审片必须产生新的 full-batch reviews，并由 WriteBrainReviewResult 写入新的 brain_runs。禁止用空 reviews 调用 WriteBrainReviewResult，也禁止只精看当前照片后结束。',
           '你必须像专业摄影师一样先理解整批，再自己选择合适工具。不要把下面能力当固定工作流。',
+          '你可以调用 GetVisionRuntimeStatus 查看本次应用生命周期内已经完成的真实视觉覆盖和缓存，避免重复看同一张照片或同一张审片板。',
           '可用策略包括：小批次可以单张精看；中大型批次可用 CreateReviewContactSheets 生成审片板，再用 ReviewContactSheetWithVision 让大脑通过缩略图墙看到整批，然后对关键照片 ReviewPhotoWithVision 高清精看，必要时 CompareSimilarGroupWithVision。',
           'CreateReviewContactSheets 是视觉载体生成工具，不是固定工作流。你可以根据任务和失败反馈主动控制 photoIds、cellsPerSheet、columns、cellWidth、cellHeight、imageHeight、jpegQuality、detail、idPrefix。',
           '已知约束：模型视觉请求可能受网络、请求体、base64 大小、模型视觉通道限制影响。工具会返回 fileSizeBytes、base64ApproxBytes、imageWidth、imageHeight、cells、photoIds、params；遇到 ReviewContactSheetWithVision 失败时，必须读取这些指标，自主决定压缩、拆分、降低 detail、只重建失败 photoIds，继续补齐视觉覆盖。重建失败部分时使用新的 idPrefix，方便追踪新审片板。',
@@ -98,6 +190,7 @@ function toolProductCopy(toolName: string): { phase: BrainUiLogEvent['phase']; t
   const copy: Record<string, { phase: BrainUiLogEvent['phase']; title: string; message?: string }> = {
     GetWorkspaceContext: { phase: 'workspace', title: '读取工作台状态' },
     GetBatchOverview: { phase: 'understanding', title: '理解整批照片', message: '正在汇总质量分布、风险标签、人工选择和连拍结构。' },
+    GetVisionRuntimeStatus: { phase: 'planning', title: '检查视觉覆盖', message: '正在确认哪些审片板和照片已经看过，避免重复请求。' },
     DecideReviewStrategy: { phase: 'planning', title: '制定审片策略', message: '正在决定哪些照片需要看图、哪些连拍组需要比较。' },
     CreateReviewContactSheets: { phase: 'vision', title: '生成整批审片板', message: '正在把整批照片排成缩略图墙，方便小宫一次覆盖全部素材。' },
     ReviewContactSheetWithVision: { phase: 'vision', title: '查看审片板', message: '小宫正在通过缩略图墙扫完整批照片。' },
@@ -124,6 +217,16 @@ function shouldAbortSiblingToolCalls(result: BrainToolResult): boolean {
   if (result.toolName === 'ReviewContactSheetWithVision') return true;
   if (result.toolName === 'ReviewPhotoWithVision' && result.content.includes('vision_payload_or_network_failure')) return true;
   return false;
+}
+
+function isParallelVisionTool(toolName: string): boolean {
+  return toolName === 'ReviewPhotoWithVision' || toolName === 'ReviewContactSheetWithVision';
+}
+
+function visionToolConcurrency(toolName: string): number {
+  const configured = Number(process.env.SENSEFRAME_BRAIN_VISION_CONCURRENCY);
+  if (Number.isFinite(configured) && configured >= 1) return Math.min(6, Math.floor(configured));
+  return toolName === 'ReviewPhotoWithVision' ? 3 : 2;
 }
 
 export async function runSenseFrameBrainRuntime(
@@ -307,7 +410,7 @@ export async function runSenseFrameBrainRuntime(
         toolCallId,
         toolName: tool.name,
         isError: false,
-        content: summarize(output),
+        content: summarizeToolOutput(tool.name, output),
         structured: output
       };
     } catch (error) {
@@ -367,6 +470,90 @@ export async function runSenseFrameBrainRuntime(
           };
           messages.push({ role: 'tool', tool_call_id: call.id, content: toolResultContent(result) });
           continue;
+        }
+        if (isParallelVisionTool(toolName)) {
+          const batch: Array<{ call: any; tool: BrainToolDefinition; input: Record<string, any> }> = [{ call, tool, input }];
+          let cursor = index + 1;
+          while (cursor < toolCalls.length) {
+            const nextCall = toolCalls[cursor];
+            const nextToolName = String(nextCall.function?.name || '');
+            const nextTool = toolMap.get(nextToolName);
+            if (!nextTool || nextTool.name !== toolName || !isParallelVisionTool(nextTool.name) || !canExecuteWithoutConfirmation(nextTool)) break;
+            batch.push({
+              call: nextCall,
+              tool: nextTool,
+              input: enrichToolInput(nextToolName, parseJsonObject(String(nextCall.function?.arguments || '{}')))
+            });
+            cursor += 1;
+          }
+          if (batch.length > 1) {
+            emitLog({
+              level: 'info',
+              phase: 'vision',
+              title: '并行查看画面',
+              message: `本轮 ${batch.length} 个 ${toolName} 相互独立，并发 ${visionToolConcurrency(toolName)} 个执行。`,
+              toolName
+            });
+            const limit = visionToolConcurrency(toolName);
+            const results: BrainToolResult[] = new Array(batch.length);
+            let next = 0;
+            let stopScheduling = false;
+            async function worker(): Promise<void> {
+              while (next < batch.length) {
+                if (stopScheduling) return;
+                const current = next;
+                next += 1;
+                const item = batch[current];
+                results[current] = await executeTool(item.tool, item.call.id, item.input);
+                if (shouldAbortSiblingToolCalls(results[current])) {
+                  stopScheduling = true;
+                }
+              }
+            }
+            await Promise.all(Array.from({ length: Math.min(limit, batch.length) }, () => worker()));
+            const firstAbort = results.find((result) => result && shouldAbortSiblingToolCalls(result));
+            for (let resultIndex = 0; resultIndex < results.length; resultIndex += 1) {
+              const result = results[resultIndex];
+              const item = batch[resultIndex];
+              if (result) {
+                messages.push({ role: 'tool', tool_call_id: result.toolCallId, content: toolResultContent(result) });
+                continue;
+              }
+              const skippedResult: BrainToolResult = {
+                toolCallId: item.call.id,
+                toolName: item.tool.name,
+                isError: true,
+                content: [
+                  firstAbort
+                    ? `同批前序工具 ${firstAbort.toolName} 失败，已取消本轮未启动工具 ${item.tool.name}。`
+                    : `本轮并发调度已取消未启动工具 ${item.tool.name}。`,
+                  '这不是最终失败；请根据已有成功结果和前一个 tool_use_error 的 payload 指标重新规划，例如压缩、拆分、降低 detail、只重建失败 photoIds 后继续补齐视觉覆盖。'
+                ].join('\n')
+              };
+              messages.push({ role: 'tool', tool_call_id: item.call.id, content: toolResultContent(skippedResult) });
+              appendTrace(traceId, 'tool.aborted', { tool: item.tool.name, reason: firstAbort ? `sibling_failed:${firstAbort.toolName}` : 'parallel_scheduler_cancelled' });
+              const aborted = {
+                toolName: item.tool.name,
+                permissionLevel: item.tool.permissionLevel,
+                requiresConfirmation: item.tool.requiresConfirmation,
+                status: 'skipped' as const
+              };
+              toolEvents.push(aborted);
+              recordBrainToolEvent(sessionId, aborted, item.input, undefined, skippedResult.content);
+            }
+            if (firstAbort) {
+              const skippedCount = Array.from({ length: results.length }).filter((_, resultIndex) => !results[resultIndex]).length;
+              emitLog({
+                level: 'info',
+                phase: 'tool',
+                title: '等待小宫重新规划',
+                message: `${firstAbort.toolName} 失败，本轮并发中未启动的 ${skippedCount} 个工具已取消，已完成的结果会一起交回大脑。`,
+                toolName: firstAbort.toolName
+              });
+            }
+            index = cursor - 1;
+            continue;
+          }
         }
         const result = await executeTool(tool, call.id, input);
         messages.push({ role: 'tool', tool_call_id: call.id, content: toolResultContent(result) });

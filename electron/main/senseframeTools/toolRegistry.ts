@@ -22,6 +22,45 @@ import type {
 import type { BrainToolDefinition } from '../brainRuntime/types';
 
 const reviewSheetCache = new Map<string, ReviewContactSheet[]>();
+const contactSheetVisionCache = new Map<string, {
+  sheetId: string;
+  reviews: BrainPhotoReviewDraft[];
+  sheetSummary: string;
+  singleVisionPhotoIds: string[];
+  createdAt: string;
+}>();
+const photoVisionCache = new Map<string, {
+  review: BrainPhotoReviewDraft;
+  createdAt: string;
+}>();
+
+function cacheKey(...parts: Array<string | undefined>): string {
+  return parts.map((part) => String(part || '')).join('::');
+}
+
+function cacheStats(batchId: string): Record<string, unknown> {
+  const sheetPrefix = `${batchId}::`;
+  const sheetEntries = [...contactSheetVisionCache.entries()].filter(([key]) => key.startsWith(sheetPrefix));
+  const photoEntries = [...photoVisionCache.entries()].filter(([key]) => key.startsWith(sheetPrefix));
+  const reviewedPhotoIds = new Set<string>();
+  for (const [, value] of sheetEntries) for (const review of value.reviews) reviewedPhotoIds.add(review.photoId);
+  for (const [, value] of photoEntries) reviewedPhotoIds.add(value.review.photoId);
+  return {
+    cachedContactSheets: sheetEntries.length,
+    cachedSinglePhotos: photoEntries.length,
+    cachedReviewedPhotos: reviewedPhotoIds.size,
+    latestContactSheets: sheetEntries.slice(-8).map(([, value]) => ({
+      sheetId: value.sheetId,
+      reviews: value.reviews.length,
+      createdAt: value.createdAt
+    })),
+    latestSinglePhotos: photoEntries.slice(-12).map(([, value]) => ({
+      photoId: value.review.photoId,
+      primaryBucket: value.review.primaryBucket,
+      createdAt: value.createdAt
+    }))
+  };
+}
 
 function storeReviewSheets(batchId: string, sheets: ReviewContactSheet[]): void {
   const byId = new Map((reviewSheetCache.get(batchId) || []).map((sheet) => [sheet.id, sheet]));
@@ -542,6 +581,30 @@ function normalizeDraftReview(raw: any, photo: PhotoView, source: BrainPhotoRevi
 export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
   return [
     {
+      name: 'GetVisionRuntimeStatus',
+      description: '读取本次应用生命周期内的小宫视觉运行状态和缓存覆盖情况。用于判断哪些审片板/单张已经看过，避免重复视觉请求；不做新的审美判断。',
+      permissionLevel: 'read',
+      requiresConfirmation: false,
+      parameters: {
+        type: 'object',
+        properties: {},
+        additionalProperties: false
+      },
+      handler: (_input, context) => {
+        const batch = getBatch(context.batchId);
+        return {
+          batchId: batch.id,
+          totalPhotos: batch.photos.length,
+          ...cacheStats(context.batchId),
+          guidance: [
+            '如果 cachedReviewedPhotos 已覆盖整批，可以直接基于已有草稿写入或继续少量高清复核。',
+            '如果只缺少少量照片，应优先生成缺失 photoIds 的审片板或单张复核，避免重复看已经缓存的照片。',
+            '缓存来自本次应用生命周期内的真实视觉工具结果，不代表历史 brainRun。'
+          ]
+        };
+      }
+    },
+    {
       name: 'GetWorkspaceContext',
       description: '读取当前 SenseFrame 工作台状态、当前批次、大脑审片状态和可用照片数量。',
       permissionLevel: 'read',
@@ -753,6 +816,24 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
         };
         if (!sheet.id || !sheet.path || !sheet.cells.length) throw new Error('ReviewContactSheetWithVision 缺少有效审片板。');
         const config = getModelConfig();
+        const visionCacheKey = cacheKey(context.batchId, config.model, sheet.id, String(input?.focusMode || 'batch'));
+        const cachedVision = contactSheetVisionCache.get(visionCacheKey);
+        if (cachedVision) {
+          context.emitLog({
+            level: 'success',
+            phase: 'vision',
+            title: `复用审片板 ${sheet.id}`,
+            message: `已复用缓存视觉结果，覆盖 ${cachedVision.reviews.length} 张照片。`,
+            progress: { current: cachedVision.reviews.length, total: sheet.cells.length }
+          });
+          return {
+            sheetId: sheet.id,
+            sheetSummary: cachedVision.sheetSummary,
+            reviews: cachedVision.reviews,
+            singleVisionPhotoIds: cachedVision.singleVisionPhotoIds,
+            cacheHit: true
+          };
+        }
         let response: any;
         try {
           response = await callChatCompletions(config, {
@@ -825,11 +906,19 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
           message: sheetSummary,
           progress: { current: reviews.length, total: sheet.cells.length }
         });
+        contactSheetVisionCache.set(visionCacheKey, {
+          sheetId: sheet.id,
+          sheetSummary,
+          reviews,
+          singleVisionPhotoIds: validatePhotoIds(batch, parsed.singleVisionPhotoIds || parsed.single_vision_photo_ids),
+          createdAt: now()
+        });
         return {
           sheetId: sheet.id,
           sheetSummary,
           reviews,
-          singleVisionPhotoIds: validatePhotoIds(batch, parsed.singleVisionPhotoIds || parsed.single_vision_photo_ids)
+          singleVisionPhotoIds: validatePhotoIds(batch, parsed.singleVisionPhotoIds || parsed.single_vision_photo_ids),
+          cacheHit: false
         };
       }
     },
@@ -969,6 +1058,19 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
         const photo = batchContext.batch.photos.find((item) => item.id === photoId);
         if (!photo) throw new Error(`照片不存在：${photoId}`);
         const config = getModelConfig();
+        const visionCacheKey = cacheKey(context.batchId, config.model, photo.id, String(input?.focusMode || 'photo'));
+        const cachedVision = photoVisionCache.get(visionCacheKey);
+        if (cachedVision) {
+          context.emitLog({
+            level: 'success',
+            phase: 'vision',
+            title: `复用 ${photo.fileName}`,
+            message: cachedVision.review.reason,
+            photoId: photo.id,
+            photoFileName: photo.fileName
+          });
+          return { review: cachedVision.review, cacheHit: true };
+        }
         const fallback = createHeuristicReview(photo, 'draft', config.model, batchContext);
         context.emitLog({
           level: 'info',
@@ -987,6 +1089,10 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
           message: draft.reason,
           photoId: photo.id,
           photoFileName: photo.fileName
+        });
+        photoVisionCache.set(visionCacheKey, {
+          review: draft,
+          createdAt: now()
         });
         return { review: draft };
       }
