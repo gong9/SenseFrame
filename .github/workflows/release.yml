@@ -93,22 +93,12 @@ jobs:
           path: artifacts
 
       - name: Create or update draft release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          mapfile -t files < <(find artifacts -type f \( -name "*.dmg" -o -name "*.zip" -o -name "*.exe" \) | sort)
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "No release artifacts found."
-            exit 1
-          fi
-
-          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" "${files[@]}" --clobber
-          else
-            gh release create "$TAG_NAME" "${files[@]}" \
-              --draft \
-              --title "SenseFrame ${TAG_NAME}" \
-              --notes "SenseFrame desktop installers."
-          fi
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: SenseFrame ${{ github.ref_name }}
+          body: SenseFrame desktop installers.
+          files: |
+            artifacts/**/*.dmg
+            artifacts/**/*.zip
+            artifacts/**/*.exe
