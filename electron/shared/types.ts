@@ -141,6 +141,12 @@ export type DeleteBatchResult = {
   failedOriginals: number;
 };
 
+export type ModelSettings = {
+  baseUrl: string;
+  model: string;
+  apiKey: string;
+};
+
 export type ImportProgress = {
   stage: 'extracting' | 'scanning' | 'analyzing' | 'clustering' | 'done' | 'error';
   message: string;

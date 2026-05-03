@@ -7,6 +7,7 @@ import type {
   DeleteBatchResult,
   ImportProgress,
   ImportResult,
+  ModelSettings,
   SearchResult,
   SemanticAnalysis,
   SmartView,
@@ -51,6 +52,8 @@ const api = {
   exportCsv: (batchId: string): Promise<string> => ipcRenderer.invoke('export:csv', batchId),
   exportSelected: (batchId: string): Promise<{ dir: string; count: number } | null> => ipcRenderer.invoke('export:selected', batchId),
   workerHint: (): Promise<string> => ipcRenderer.invoke('system:workerHint'),
+  getModelSettings: (): Promise<ModelSettings> => ipcRenderer.invoke('settings:getModel'),
+  saveModelSettings: (settings: ModelSettings): Promise<ModelSettings> => ipcRenderer.invoke('settings:saveModel', settings),
   fileUrl: (path?: string): string => (path ? `senseframe://image?path=${encodeURIComponent(path)}` : '')
 };
 

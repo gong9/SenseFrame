@@ -3,6 +3,7 @@ import { basename, extname, join } from 'node:path';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { is } from '@electron-toolkit/utils';
 import { loadLocalEnv } from './env';
+import { applyModelSettings, getModelSettings, saveModelSettings } from './appSettings';
 import { analyzeSemantic, semanticSearch } from './openaiService';
 import { recordBrainFeedback } from './brainService';
 import { failInterruptedBrainSessions } from './brainRuntime/sessionStore';
@@ -62,6 +63,7 @@ protocol.registerSchemesAsPrivileged([{ scheme: 'senseframe', privileges: { stan
 
 app.whenReady().then(() => {
   loadLocalEnv();
+  applyModelSettings();
   const interruptedSessions = failInterruptedBrainSessions();
   if (interruptedSessions) console.warn(`[SenseFrame] marked ${interruptedSessions} interrupted Xiaogong sessions as failed`);
   applyDockIcon();
@@ -125,6 +127,8 @@ app.whenReady().then(() => {
   ipcMain.handle('xiaogong:getSmartView', async (_event, viewId: string) => getSmartView(viewId));
   ipcMain.handle('xiaogong:listSmartViews', async (_event, batchId: string) => listSmartViews(batchId));
   ipcMain.handle('system:workerHint', async () => workerHint());
+  ipcMain.handle('settings:getModel', async () => getModelSettings());
+  ipcMain.handle('settings:saveModel', async (_event, settings) => saveModelSettings(settings));
   ipcMain.handle('export:csv', async (_event, batchId: string) => {
     const batch = getBatch(batchId);
     const rows = [

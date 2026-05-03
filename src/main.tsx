@@ -10,9 +10,13 @@ import {
   HardDrive,
   Home,
   Image as ImageIcon,
+  KeyRound,
   Layers,
   Loader2,
   ScanFace,
+  Server,
+  Settings,
+  SlidersHorizontal,
   Sparkles,
   Star,
   Send,
@@ -31,6 +35,7 @@ import type {
   Cluster,
   Decision,
   ImportProgress,
+  ModelSettings,
   PhotoView,
   SearchResult,
   SmartView,
@@ -264,6 +269,10 @@ function App(): React.ReactElement {
   const [activeSmartView, setActiveSmartView] = useState<SmartView | null>(null);
   const [importProgress, setImportProgress] = useState<ImportProgress | null>(null);
   const [notice, setNotice] = useState('');
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [modelSettings, setModelSettings] = useState<ModelSettings>({ baseUrl: 'https://api.openai.com/v1', model: 'gpt-5.5', apiKey: '' });
+  const [settingsDraft, setSettingsDraft] = useState<ModelSettings>(modelSettings);
+  const [settingsSaving, setSettingsSaving] = useState(false);
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);
   const [debugMode, setDebugMode] = useState(false);
@@ -289,6 +298,27 @@ function App(): React.ReactElement {
   async function refreshBatches(): Promise<void> {
     if (!window.senseframe) return;
     setBatches(await window.senseframe.listBatches());
+  }
+
+  async function loadModelSettings(): Promise<void> {
+    if (!window.senseframe) return;
+    const next = await window.senseframe.getModelSettings();
+    setModelSettings(next);
+    setSettingsDraft(next);
+  }
+
+  async function saveSettings(): Promise<void> {
+    if (!window.senseframe) return;
+    setSettingsSaving(true);
+    try {
+      const next = await window.senseframe.saveModelSettings(settingsDraft);
+      setModelSettings(next);
+      setSettingsDraft(next);
+      setSettingsOpen(false);
+      setNotice(next.apiKey ? '模型设置已保存，小宫会使用新的模型配置。' : '模型设置已保存，但 API Key 为空。');
+    } finally {
+      setSettingsSaving(false);
+    }
   }
 
   async function loadBatch(id: string, options?: { preserveSmartViewId?: string; preservePhotoId?: string; resetView?: boolean }): Promise<void> {
@@ -373,6 +403,7 @@ function App(): React.ReactElement {
 
   useEffect(() => {
     refreshBatches().then(() => undefined);
+    loadModelSettings().then(() => undefined);
     if (!window.senseframe) return;
     const offImport = window.senseframe.onImportProgress((progress) => {
       setImportProgress(progress);
@@ -963,8 +994,9 @@ function App(): React.ReactElement {
               <p>{batch ? (mode === 'smartView' && activeSmartView ? activeSmartView.summary : `${batch.name} · ${batch.clusters.length} 个相似组 · ${stats.rejected} 张淘汰建议已确认`) : '导入后会自动生成缩略图、RAW 预览、质量分、人脸闭眼检测和相似组。'}</p>
             </div>
           </div>
-          {batch && (
-            <div className="toolbar">
+          <div className="toolbar">
+            {batch && (
+              <>
               <button className="brain-action" onClick={runBrainReview} disabled={Boolean(brainBusy || busy)} title="小宫审片">
                 {brainBusy ? <Loader2 className="spin" size={16} /> : <Brain size={16} />} 小宫
               </button>
@@ -972,8 +1004,19 @@ function App(): React.ReactElement {
                 <ScanFace size={16} /> 调试
               </button>
               <button onClick={exportSelected} title="导出已选"><Download size={16} /> 导出</button>
-            </div>
-          )}
+              </>
+            )}
+            <button
+              className={!modelSettings.apiKey ? 'needs-settings' : ''}
+              onClick={() => {
+                setSettingsDraft(modelSettings);
+                setSettingsOpen(true);
+              }}
+              title="模型设置"
+            >
+              <Settings size={16} /> 设置
+            </button>
+          </div>
         </header>
 
         {!batch ? (
@@ -1119,9 +1162,110 @@ function App(): React.ReactElement {
             </button>
           </div>
         )}
+        {settingsOpen && (
+          <ModelSettingsDialog
+            value={settingsDraft}
+            saving={settingsSaving}
+            onChange={setSettingsDraft}
+            onCancel={() => {
+              setSettingsDraft(modelSettings);
+              setSettingsOpen(false);
+            }}
+            onSave={saveSettings}
+          />
+        )}
         {importProgress && <ImportOverlay progress={importProgress} />}
       </section>
     </main>
+  );
+}
+
+function ModelSettingsDialog({
+  value,
+  saving,
+  onChange,
+  onCancel,
+  onSave
+}: {
+  value: ModelSettings;
+  saving: boolean;
+  onChange: (value: ModelSettings) => void;
+  onCancel: () => void;
+  onSave: () => void;
+}): React.ReactElement {
+  const canSave = Boolean(value.baseUrl.trim() && value.model.trim());
+  const configured = Boolean(value.apiKey.trim());
+
+  return (
+    <div className="settings-backdrop" role="presentation">
+      <section className="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="model-settings-title">
+        <div className="settings-dialog-head">
+          <div className="settings-title-lockup">
+            <span><Brain size={16} /></span>
+            <div>
+              <h2 id="model-settings-title">模型设置</h2>
+              <p>小宫大脑连接</p>
+            </div>
+          </div>
+          <button type="button" onClick={onCancel} aria-label="关闭设置">
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className={`settings-status ${configured ? 'ready' : 'empty'}`}>
+          <div>
+            <strong>{configured ? '已配置 API Key' : '等待配置 API Key'}</strong>
+            <span>{configured ? `${value.model || '未选择模型'} · ${value.baseUrl || '未设置地址'}` : '保存后，小宫审片和语义分析会使用这里的模型服务。'}</span>
+          </div>
+          <em>{configured ? 'Ready' : 'Setup'}</em>
+        </div>
+
+        <div className="settings-fields">
+          <label className="settings-field">
+            <span><Server size={14} /> 服务地址</span>
+            <div>
+              <input
+                value={value.baseUrl}
+                placeholder="https://api.openai.com/v1"
+                onChange={(event) => onChange({ ...value, baseUrl: event.target.value })}
+              />
+            </div>
+          </label>
+
+          <label className="settings-field">
+            <span><SlidersHorizontal size={14} /> 模型</span>
+            <div>
+              <input
+                value={value.model}
+                placeholder="gpt-5.5"
+                onChange={(event) => onChange({ ...value, model: event.target.value })}
+              />
+            </div>
+          </label>
+
+          <label className="settings-field">
+            <span><KeyRound size={14} /> API Key</span>
+            <div>
+              <input
+                type="password"
+                value={value.apiKey}
+                placeholder="sk-..."
+                autoComplete="off"
+                onChange={(event) => onChange({ ...value, apiKey: event.target.value })}
+              />
+            </div>
+          </label>
+        </div>
+
+        <div className="settings-dialog-actions">
+          <button type="button" onClick={onCancel}>取消</button>
+          <button type="button" className="primary" onClick={onSave} disabled={!canSave || saving}>
+            {saving ? <Loader2 className="spin" size={14} /> : <Check size={14} />}
+            保存
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }
 

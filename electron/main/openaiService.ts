@@ -5,7 +5,7 @@ import { getBatch } from './photoPipeline';
 import type { SearchResult, SemanticAnalysis } from '../shared/types';
 
 function visionModel(): string {
-  return process.env.OPENAI_VISION_MODEL || 'gpt-5.4-mini';
+  return process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-5.4-mini';
 }
 
 function embeddingModel(): string {
@@ -18,7 +18,10 @@ function now(): string {
 
 function client(): OpenAI | null {
   if (!process.env.OPENAI_API_KEY) return null;
-  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+    baseURL: process.env.OPENAI_BASE_URL || undefined
+  });
 }
 
 function mockSemantic(photoId: string): SemanticAnalysis {
