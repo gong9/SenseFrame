@@ -17,9 +17,11 @@ function getAppIconPath(): string {
 function applyDockIcon(): void {
   const iconPath = getAppIconPath();
   if (process.platform === 'darwin' && existsSync(iconPath)) {
-    app.dock.setIcon(nativeImage.createFromPath(iconPath));
+    app.dock?.setIcon(nativeImage.createFromPath(iconPath));
   }
 }
+
+app.setName('SenseFrame');
 
 function createWindow(): void {
   const iconPath = getAppIconPath();
