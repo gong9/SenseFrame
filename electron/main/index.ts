@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, protocol } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, protocol } from 'electron';
 import { basename, extname, join } from 'node:path';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { is } from '@electron-toolkit/utils';
@@ -10,8 +10,19 @@ import { runXiaogongTask } from './xiaogongOrchestrator';
 import { getSmartView, listSmartViews } from './xiaogongSmartViewService';
 import { deleteBatch, getBatch, importSource, listBatches, reanalyzeBatch, rebuildClusters, saveDecision, workerHint } from './photoPipeline';
 
+function getAppIconPath(): string {
+  return join(app.getAppPath(), 'build/icon.png');
+}
+
+function applyDockIcon(): void {
+  const iconPath = getAppIconPath();
+  if (process.platform === 'darwin' && existsSync(iconPath)) {
+    app.dock.setIcon(nativeImage.createFromPath(iconPath));
+  }
+}
+
 function createWindow(): void {
-  const iconPath = join(app.getAppPath(), 'build/icon.png');
+  const iconPath = getAppIconPath();
   const win = new BrowserWindow({
     width: 1440,
     height: 960,
@@ -39,6 +50,7 @@ protocol.registerSchemesAsPrivileged([{ scheme: 'senseframe', privileges: { stan
 
 app.whenReady().then(() => {
   loadLocalEnv();
+  applyDockIcon();
   protocol.handle('senseframe', async (request) => {
     const filePath = new URL(request.url).searchParams.get('path');
     if (!filePath) return new Response('Missing file path', { status: 400 });
