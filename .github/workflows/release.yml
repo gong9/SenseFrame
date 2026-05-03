@@ -45,6 +45,25 @@ jobs:
       - name: Typecheck
         run: pnpm run typecheck
 
+      - name: Prepare DMG builder
+        if: matrix.platform == 'mac'
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          if [ "$arch" = "arm64" ]; then
+            bundle_arch="arm64"
+          else
+            bundle_arch="x86_64"
+          fi
+
+          mkdir -p "$RUNNER_TEMP/dmgbuild"
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/dmgbuild.tar.gz" \
+            "https://github.com/electron-userland/electron-builder-binaries/releases/download/dmg-builder@1.2.0/dmgbuild-bundle-${bundle_arch}-75c8a6c.tar.gz"
+          tar -xzf "$RUNNER_TEMP/dmgbuild.tar.gz" -C "$RUNNER_TEMP/dmgbuild" --strip-components=1
+          test -x "$RUNNER_TEMP/dmgbuild/dmgbuild"
+          echo "CUSTOM_DMGBUILD_PATH=$RUNNER_TEMP/dmgbuild/dmgbuild" >> "$GITHUB_ENV"
+
       - name: Build installer
         run: ${{ matrix.command }}
         env:
