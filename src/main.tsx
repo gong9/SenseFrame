@@ -1090,7 +1090,6 @@ function App(): React.ReactElement {
               <XiaogongConsole
                 busy={xiaogongBusy}
                 input={xiaogongInput}
-                progress={xiaogongProgress}
                 activity={xiaogongActivity}
                 result={lastXiaogongResult}
                 activeSmartView={activeSmartView}
@@ -1356,7 +1355,6 @@ function PhotoPanel({
 function XiaogongConsole({
   busy,
   input,
-  progress,
   activity,
   result,
   activeSmartView,
@@ -1366,7 +1364,6 @@ function XiaogongConsole({
 }: {
   busy: string;
   input: string;
-  progress: XiaogongProgressEvent | null;
   activity: BrainUiLogEvent[];
   result: XiaogongRunResult | null;
   activeSmartView: SmartView | null;
@@ -1405,13 +1402,6 @@ function XiaogongConsole({
           <button key={task} onClick={() => onRun(task)} disabled={Boolean(busy)}>{task}</button>
         ))}
       </div>
-
-      {busy && (
-        <div className="xiaogong-status">
-          <Loader2 className="spin" size={14} />
-          <span>{progress?.message || busy}</span>
-        </div>
-      )}
 
       <XiaogongLogTimeline activity={activity} active={Boolean(busy)} />
 
