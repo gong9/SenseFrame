@@ -11,6 +11,7 @@ import { getSmartView, listSmartViews } from './xiaogongSmartViewService';
 import { deleteBatch, getBatch, importSource, listBatches, reanalyzeBatch, rebuildClusters, saveDecision, workerHint } from './photoPipeline';
 
 function createWindow(): void {
+  const iconPath = join(app.getAppPath(), 'build/icon.png');
   const win = new BrowserWindow({
     width: 1440,
     height: 960,
@@ -18,6 +19,7 @@ function createWindow(): void {
     minHeight: 760,
     title: 'SenseFrame',
     backgroundColor: '#090908',
+    ...(existsSync(iconPath) ? { icon: iconPath } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.mjs'),
       sandbox: false,
