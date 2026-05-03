@@ -160,6 +160,13 @@ function migrate(database: Database.Database): void {
       group_id TEXT,
       group_rank INTEGER,
       group_role TEXT,
+      review_source TEXT NOT NULL DEFAULT 'single_vision',
+      sheet_id TEXT,
+      sheet_cell INTEGER,
+      aesthetic_pass INTEGER,
+      aesthetic_reject_reasons TEXT NOT NULL DEFAULT '[]',
+      fatal_flaws TEXT NOT NULL DEFAULT '[]',
+      composition_tags TEXT NOT NULL DEFAULT '[]',
       model TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -268,7 +275,14 @@ function ensureBrainColumns(database: Database.Database): void {
   ensureColumns(database, 'brain_bucket_assignments', [
     ['group_id', 'TEXT'],
     ['group_rank', 'INTEGER'],
-    ['group_role', 'TEXT']
+    ['group_role', 'TEXT'],
+    ['review_source', "TEXT NOT NULL DEFAULT 'single_vision'"],
+    ['sheet_id', 'TEXT'],
+    ['sheet_cell', 'INTEGER'],
+    ['aesthetic_pass', 'INTEGER'],
+    ['aesthetic_reject_reasons', "TEXT NOT NULL DEFAULT '[]'"],
+    ['fatal_flaws', "TEXT NOT NULL DEFAULT '[]'"],
+    ['composition_tags', "TEXT NOT NULL DEFAULT '[]'"]
   ]);
 }
 

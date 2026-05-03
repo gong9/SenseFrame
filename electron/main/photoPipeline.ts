@@ -658,6 +658,13 @@ export function getBatch(batchId: string): BatchView {
               groupId: brain.group_id || undefined,
               groupRank: brain.group_rank || undefined,
               groupRole: brain.group_role || undefined,
+              reviewSource: brain.review_source || undefined,
+              sheetId: brain.sheet_id || undefined,
+              sheetCell: brain.sheet_cell || undefined,
+              aestheticPass: brain.aesthetic_pass === null || brain.aesthetic_pass === undefined ? undefined : Boolean(brain.aesthetic_pass),
+              aestheticRejectReasons: JSON.parse(brain.aesthetic_reject_reasons || '[]'),
+              fatalFlaws: JSON.parse(brain.fatal_flaws || '[]'),
+              compositionTags: JSON.parse(brain.composition_tags || '[]'),
               model: brain.model,
               createdAt: brain.created_at
             }

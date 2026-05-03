@@ -1,0 +1,45 @@
+export const PHOTO_AESTHETIC_RUNTIME_PROMPT = [
+  '小宫内置摄影审美 Skill：先判断照片是否达到交付级，再判断应该放入哪个产品分组。',
+  'featured 只代表摄影师可交付、可展示、可作为封面/精选候选的照片；不是“这批里相对好一点”。',
+  '坏批次可以 0 张 featured。宁可给复核候选，也不要把明显随拍、背景脏、逆光灰、主体弱、构图散的照片写成精选。',
+  '参考审美维度来自 PPA 12 elements、CADB/PICD 构图标注和通用视觉审美基准：impact, technical excellence, composition, center of interest, lighting, subject matter, color balance, storytelling, finish。',
+  '情绪好不是免死牌：如果背景严重抢戏、光线毁主体、主体不清、脸部/动作失败、画面完成度低，不能 featured。',
+  'closed_eyes、face_missing、low_score 不要机械判废；但必须通过画面判断它们是表达、空镜/细节，还是失败。'
+].join('\n');
+
+export const PHOTO_AESTHETIC_JSON_CONTRACT = [
+  '每张照片除原有字段外，必须尽量返回：',
+  'aestheticPass: boolean，表示是否达到交付级审美门槛。',
+  'deliverableScore: 0-1，表示交付/展示可用性，不是相对排名。',
+  'fatalFlaws: string[]，记录导致不能精选的致命问题，如 background_clutter, harsh_backlight, weak_subject, missed_focus, snapshot_composition, bad_crop, low_finish。',
+  'aestheticRejectReasons: string[]，用摄影师语言说明为什么不该精选。',
+  'compositionTags: string[]，可写 thirds, centered, diagonal, layered, leading_lines, frame_within_frame, cluttered, snapshot, static, cropped_subject 等。',
+  'visualScores 继续使用 visualQuality, expression, moment, composition, backgroundCleanliness, storyValue；如果能判断，也补充 lighting, subjectClarity, finish, deliverableScore。'
+].join('\n');
+
+export const PHOTO_AESTHETIC_FEATURED_GATE = [
+  'featured 硬门槛：',
+  '1. aestheticPass 必须为 true。',
+  '2. deliverableScore 通常要 >= 0.76；审片板缩略图阶段要更谨慎。',
+  '3. composition、backgroundCleanliness、visualQuality 不能明显短板。',
+  '4. fatalFlaws 必须为空或只有非常轻微问题。',
+  '5. 至少有一个强瞬间/表情/故事/形式亮点；普通清楚但无亮点不是 featured。',
+  '6. recommendedAction 必须是 pick；maybe/review 默认不是 featured。'
+].join('\n');
+
+export const PHOTO_AESTHETIC_REJECT_EXAMPLES = [
+  '有情绪但树枝/杂物压住主体、背景抢戏：similarBursts 或 eyeReview，不是 featured。',
+  '逆光灰雾、脸和衣服没有质感、主体不突出：technical 或 similarBursts。',
+  '像随手记录、构图没有中心、主体太低/太边缘/被裁切：similarBursts 或 subject。',
+  '小模型高分但画面完成度不够：写入 smallModelOverrides，并降低 deliverableScore。',
+  '整批都弱时：summary 要明确“本批不建议精选”或“仅保留人工复核候选”。'
+].join('\n');
+
+export function photoAestheticPrompt(): string {
+  return [
+    PHOTO_AESTHETIC_RUNTIME_PROMPT,
+    PHOTO_AESTHETIC_JSON_CONTRACT,
+    PHOTO_AESTHETIC_FEATURED_GATE,
+    PHOTO_AESTHETIC_REJECT_EXAMPLES
+  ].join('\n');
+}

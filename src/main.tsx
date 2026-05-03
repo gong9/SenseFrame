@@ -272,6 +272,7 @@ function App(): React.ReactElement {
   const [imagePan, setImagePan] = useState({ x: 0, y: 0 });
   const dragRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
+  const activeBatchIdRef = useRef<string | null>(null);
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   const [imageSize, setImageSize] = useState({ width: 0, height: 0 });
 
@@ -280,6 +281,10 @@ function App(): React.ReactElement {
     const timeout = window.setTimeout(() => setNotice(''), notice.length > 100 ? 8000 : 4800);
     return () => window.clearTimeout(timeout);
   }, [notice]);
+
+  useEffect(() => {
+    activeBatchIdRef.current = batch?.id || null;
+  }, [batch?.id]);
 
   async function refreshBatches(): Promise<void> {
     if (!window.senseframe) return;
@@ -377,6 +382,13 @@ function App(): React.ReactElement {
       setBrainProgress(progress);
       setBrainActivity((items) => [progress, ...items].slice(0, 8));
       if (progress.status === 'running') setBrainBusy(`${progress.message} ${progress.current}/${progress.total}`);
+      if (progress.status === 'completed' || progress.status === 'failed') {
+        setBrainBusy('');
+        const batchId = progress.batchId || activeBatchIdRef.current;
+        if (batchId) {
+          void loadBatch(batchId, { resetView: false }).then(() => refreshBatches());
+        }
+      }
     });
     const offXiaogong = window.senseframe.onXiaogongProgress((progress) => {
       setXiaogongProgress(progress);
@@ -403,8 +415,6 @@ function App(): React.ReactElement {
       return new Set(batch.photos
         .filter((photo) => photo.decision !== 'reject')
         .filter((photo) => photo.brainReview?.primaryBucket === 'featured')
-        .filter((photo) => photo.brainReview?.recommendedAction === 'pick' || photo.brainReview?.recommendedAction === 'none' || photo.decision === 'pick')
-        .filter((photo) => !photo.brainReview?.needsHumanReview || photo.decision === 'pick')
         .map((photo) => photo.id));
     }
     return featuredPhotoIds(batch, burstMeta, clusterMeta);
@@ -1550,12 +1560,21 @@ function BrainActivityPanel({
   const pctValue = total ? Math.min(100, Math.round((current / total) * 100)) : 0;
   const recentActivity = (activity.length ? activity : progress ? [progress] : []).slice(0, 3);
   const statusLabel = active ? '审片中' : status === 'completed' ? '上次审片' : status === 'failed' ? '审片失败' : '审片状态';
+  const statusMeta = total
+    ? `${current}/${total}`
+    : status === 'completed'
+      ? '完成'
+      : status === 'failed'
+        ? '失败'
+        : active
+          ? '进行中'
+          : '待开始';
 
   return (
     <section className={`brain-activity-panel ${status}`}>
       <div className="brain-activity-head">
         <span>{active ? <Loader2 className="spin" size={15} /> : <Brain size={15} />} {statusLabel}</span>
-        <em>{total ? `${current}/${total}` : status === 'completed' ? '完成' : '准备中'}</em>
+        <em>{statusMeta}</em>
       </div>
       <div className="brain-activity-track">
         <i style={{ width: `${pctValue}%` }} />

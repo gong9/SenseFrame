@@ -17,18 +17,33 @@ export function getModelConfig(): ModelConfig {
 }
 
 export async function callChatCompletions(config: ModelConfig, body: Record<string, unknown>): Promise<any> {
-  const response = await fetch(`${config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${config.apiKey}`,
-      'content-type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: config.model,
-      temperature: 0,
-      ...body
-    })
-  });
+  const timeoutMs = Math.max(10_000, Math.min(180_000, Number(process.env.OPENAI_REQUEST_TIMEOUT_MS) || 65_000));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let response: Response;
+
+  try {
+    response = await fetch(`${config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${config.apiKey}`,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: config.model,
+        temperature: 0,
+        ...body
+      }),
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`小宫大脑模型请求超时：${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!response.ok) {
     const text = await response.text().catch(() => '');

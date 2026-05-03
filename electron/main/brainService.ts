@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { app } from 'electron';
 import { getDb } from './db';
 import { getModelConfig, type ModelConfig } from './brainRuntime/modelProvider';
+import { photoAestheticPrompt } from './brainRuntime/photoAestheticRubric';
 import { getBatch } from './photoPipeline';
 import type {
   BatchView,
@@ -30,6 +31,16 @@ type RawBrainReview = {
   small_model_overrides?: unknown[];
   needs_human_review?: boolean;
   visual_scores?: Partial<Record<keyof BrainVisualScores, number>>;
+  deliverable_score?: number;
+  deliverableScore?: number;
+  aesthetic_pass?: boolean;
+  aestheticPass?: boolean;
+  aesthetic_reject_reasons?: unknown[];
+  aestheticRejectReasons?: unknown[];
+  fatal_flaws?: unknown[];
+  fatalFlaws?: unknown[];
+  composition_tags?: unknown[];
+  compositionTags?: unknown[];
   representative_rank?: number;
   group_reason?: string;
 };
@@ -256,7 +267,11 @@ function normalizeScores(input?: RawBrainReview['visual_scores'], photo?: PhotoV
     moment: clamp01(input?.moment, fallback),
     composition: clamp01(input?.composition, fallback),
     backgroundCleanliness: clamp01(input?.backgroundCleanliness, fallback),
-    storyValue: clamp01(input?.storyValue, fallback)
+    storyValue: clamp01(input?.storyValue, fallback),
+    lighting: input?.lighting === undefined ? undefined : clamp01(input.lighting, fallback),
+    subjectClarity: input?.subjectClarity === undefined ? undefined : clamp01(input.subjectClarity, fallback),
+    finish: input?.finish === undefined ? undefined : clamp01(input.finish, fallback),
+    deliverableScore: input?.deliverableScore === undefined ? undefined : clamp01(input.deliverableScore, fallback)
   };
 }
 
@@ -264,6 +279,10 @@ export function parseReview(text: string, photo: PhotoView, fallbackBucket: Brai
   const jsonText = text.trim().startsWith('{') ? text.trim() : text.match(/\{[\s\S]*\}/)?.[0] || '{}';
   const raw = JSON.parse(jsonText) as RawBrainReview;
   const bucket = normalizeBucket(raw.primary_bucket, fallbackBucket);
+  const visualScores = normalizeScores({
+    ...(raw.visual_scores || {}),
+    deliverableScore: raw.deliverableScore ?? raw.deliverable_score ?? raw.visual_scores?.deliverableScore
+  }, photo);
   return {
     primaryBucket: bucket,
     secondaryBuckets: Array.isArray(raw.secondary_buckets)
@@ -274,7 +293,11 @@ export function parseReview(text: string, photo: PhotoView, fallbackBucket: Brai
     reason: String(raw.reason || '大脑没有返回明确理由。'),
     smallModelOverrides: normalizeTextList(raw.small_model_overrides),
     needsHumanReview: Boolean(raw.needs_human_review),
-    visualScores: normalizeScores(raw.visual_scores, photo),
+    visualScores,
+    aestheticPass: typeof raw.aesthetic_pass === 'boolean' ? raw.aesthetic_pass : typeof raw.aestheticPass === 'boolean' ? raw.aestheticPass : undefined,
+    aestheticRejectReasons: normalizeTextList(raw.aesthetic_reject_reasons || raw.aestheticRejectReasons),
+    fatalFlaws: normalizeTextList(raw.fatal_flaws || raw.fatalFlaws),
+    compositionTags: normalizeTextList(raw.composition_tags || raw.compositionTags),
     representativeRank: typeof raw.representative_rank === 'number' ? raw.representative_rank : undefined,
     groupReason: raw.group_reason ? String(raw.group_reason) : undefined
   };
@@ -459,8 +482,10 @@ export async function callVisionModel(config: ModelConfig, photo: PhotoView, sco
       messages: [
         {
           role: 'system',
-          content:
-            '你是 SenseFrame 内部的小宫审片大脑。你的任务是专业摄影审片分组：真实看图，结合小模型和批次上下文，给出最终 AI 桶位。输出只能是 JSON。'
+          content: [
+            '你是 SenseFrame 内部的小宫审片大脑。你的任务是专业摄影审片分组：真实看图，结合小模型和批次上下文，给出最终 AI 桶位。输出只能是 JSON。',
+            photoAestheticPrompt()
+          ].join('\n')
         },
         {
           role: 'user',
@@ -478,7 +503,7 @@ export async function callVisionModel(config: ModelConfig, photo: PhotoView, sco
                 '如果小模型明显误判，请写入 small_model_overrides。',
                 '如果信息不足、需要摄影师偏好、或需要和组内其它图二次比较，请 needs_human_review=true。',
                 'visual_scores 使用 0-1 数值，字段: visualQuality, expression, moment, composition, backgroundCleanliness, storyValue。',
-                '返回 JSON keys: primary_bucket, secondary_buckets, confidence, recommended_action, reason, small_model_overrides, needs_human_review, visual_scores, representative_rank, group_reason。',
+                '返回 JSON keys: primary_bucket, secondary_buckets, confidence, recommended_action, reason, small_model_overrides, needs_human_review, visual_scores, aesthetic_pass, aesthetic_reject_reasons, fatal_flaws, composition_tags, representative_rank, group_reason。',
                 '',
                 '本地小模型和人工上下文:',
                 localPhotoContext(photo)
@@ -509,8 +534,9 @@ export function saveReview(review: BrainPhotoReview, batchId: string): void {
         photo_id, run_id, batch_id, primary_bucket, secondary_buckets, confidence,
         recommended_action, reason, small_model_overrides, needs_human_review,
         visual_scores, representative_rank, group_reason, group_id, group_rank, group_role,
-        model, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        review_source, sheet_id, sheet_cell, aesthetic_pass, aesthetic_reject_reasons,
+        fatal_flaws, composition_tags, model, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     .run(
       review.photoId,
@@ -529,6 +555,13 @@ export function saveReview(review: BrainPhotoReview, batchId: string): void {
       review.groupId || null,
       review.groupRank || null,
       review.groupRole || null,
+      review.reviewSource || 'single_vision',
+      review.sheetId || null,
+      review.sheetCell || null,
+      review.aestheticPass === undefined ? null : review.aestheticPass ? 1 : 0,
+      JSON.stringify(review.aestheticRejectReasons || []),
+      JSON.stringify(review.fatalFlaws || []),
+      JSON.stringify(review.compositionTags || []),
       review.model,
       review.createdAt,
       now()

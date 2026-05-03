@@ -328,6 +328,10 @@ export type BrainVisualScores = {
   composition: number;
   backgroundCleanliness: number;
   storyValue: number;
+  lighting?: number;
+  subjectClarity?: number;
+  finish?: number;
+  deliverableScore?: number;
 };
 
 export type BrainPhotoReview = {
@@ -341,11 +345,18 @@ export type BrainPhotoReview = {
   smallModelOverrides: string[];
   needsHumanReview: boolean;
   visualScores: BrainVisualScores;
+  aestheticPass?: boolean;
+  aestheticRejectReasons?: string[];
+  fatalFlaws?: string[];
+  compositionTags?: string[];
   representativeRank?: number;
   groupReason?: string;
   groupId?: string;
   groupRank?: number;
   groupRole?: 'representative' | 'backup' | 'rejected' | 'single';
+  reviewSource?: 'sheet_vision' | 'single_vision' | 'group_vision';
+  sheetId?: string;
+  sheetCell?: number;
   model: string;
   createdAt: string;
 };
@@ -368,6 +379,13 @@ export type BrainPhotoReviewDraft = {
   smallModelOverrides: string[];
   needsHumanReview: boolean;
   visualScores: BrainVisualScores;
+  aestheticPass?: boolean;
+  aestheticRejectReasons?: string[];
+  fatalFlaws?: string[];
+  compositionTags?: string[];
+  reviewSource?: 'sheet_vision' | 'single_vision' | 'group_vision';
+  sheetId?: string;
+  sheetCell?: number;
 };
 
 export type BrainGroupReviewDraft = {

@@ -2,8 +2,9 @@ import { getModelConfig, callChatCompletions } from './modelProvider';
 import { canExecuteWithoutConfirmation } from './permissionPolicy';
 import { toolResultContent } from './resultMapper';
 import { createTraceId, appendTrace } from './traceLogger';
-import { createBrainSession, finishBrainSession, makeUiLog, recordBrainToolEvent, toProgress } from './sessionStore';
+import { createBrainSession, finishBrainSession, makeUiLog, recordBrainToolEvent, toProgress, touchBrainSession } from './sessionStore';
 import { createSenseFrameToolRegistry } from '../senseframeTools/toolRegistry';
+import { PHOTO_AESTHETIC_RUNTIME_PROMPT } from './photoAestheticRubric';
 import type { BrainArtifact, BrainGroupReviewDraft, BrainPhotoReviewDraft, BrainUiLogEvent, ConfirmationRequest, XiaogongProgressEvent, XiaogongToolEventSummary } from '../../shared/types';
 import type { BrainRuntimeOutput, BrainRuntimeRequest, BrainToolContext, BrainToolDefinition, BrainToolResult } from './types';
 
@@ -30,6 +31,8 @@ function toolsForMode(mode: BrainRuntimeRequest['mode'], tools: BrainToolDefinit
   const reviewTools = new Set([
     'GetBatchOverview',
     'DecideReviewStrategy',
+    'CreateReviewContactSheets',
+    'ReviewContactSheetWithVision',
     'ReviewPhotoWithVision',
     'CompareSimilarGroupWithVision',
     'WriteBrainReviewResult'
@@ -44,15 +47,25 @@ function systemPrompt(mode: BrainRuntimeRequest['mode']): string {
     'SmartView 只是工具产物，不是你的大脑本体。不要编造照片内容；如果没有视觉依据，要调用审片/视觉工具或说明依据不足。',
     '工具失败时你会收到 is_error 结果，必须根据错误继续纠错、换工具、降级说明或给用户明确交接。',
     '人工 decision、导出、删除类动作必须等待确认，不能静默执行。',
+    PHOTO_AESTHETIC_RUNTIME_PROMPT,
     '你的最终回答必须是 JSON object，字段: message, summary, uiPatch, currentPhotoExplanation。不要输出 markdown。',
     '如果任务是找最好看的/封面/筛选/分组，必须先 GetBatchOverview，再基于大脑结果调用 CreateSmartView。',
     mode === 'review'
       ? [
           '当前任务来自“小宫审片”按钮，禁止调用 StartBrainReview 或任何 legacy 大工作流。',
           '小宫审片的产品结果是改 AI 分组和照片判断，不是创建或打开小宫视图。',
-          '你必须按顺序推进：GetBatchOverview -> DecideReviewStrategy -> ReviewPhotoWithVision -> CompareSimilarGroupWithVision -> WriteBrainReviewResult -> final JSON。',
+          'GetBatchOverview 里的 brainRun/brainReview 只是历史审片结果，不能视为本次审片已经完成，不能沿用旧结果跳过本次全量视觉覆盖。',
+          '本次审片必须产生新的 full-batch reviews，并由 WriteBrainReviewResult 写入新的 brain_runs。禁止用空 reviews 调用 WriteBrainReviewResult，也禁止只精看当前照片后结束。',
+          '你必须像专业摄影师一样先理解整批，再自己选择合适工具。不要把下面能力当固定工作流。',
+          '可用策略包括：小批次可以单张精看；中大型批次可用 CreateReviewContactSheets 生成审片板，再用 ReviewContactSheetWithVision 让大脑通过缩略图墙看到整批，然后对关键照片 ReviewPhotoWithVision 高清精看，必要时 CompareSimilarGroupWithVision。',
+          'CreateReviewContactSheets 是视觉载体生成工具，不是固定工作流。你可以根据任务和失败反馈主动控制 photoIds、cellsPerSheet、columns、cellWidth、cellHeight、imageHeight、jpegQuality、detail、idPrefix。',
+          '已知约束：模型视觉请求可能受网络、请求体、base64 大小、模型视觉通道限制影响。工具会返回 fileSizeBytes、base64ApproxBytes、imageWidth、imageHeight、cells、photoIds、params；遇到 ReviewContactSheetWithVision 失败时，必须读取这些指标，自主决定压缩、拆分、降低 detail、只重建失败 photoIds，继续补齐视觉覆盖。重建失败部分时使用新的 idPrefix，方便追踪新审片板。',
+          '最终 WriteBrainReviewResult 必须覆盖整批每一张照片；只写部分照片会被工具拒绝。',
           'ReviewPhotoWithVision 只返回单张草稿，不写库；CompareSimilarGroupWithVision 只返回组比较草稿，不写库；只有 WriteBrainReviewResult 可以写入 brain_*。',
-          '不要固定审片张数。根据批次质量分布、风险 flags、人工选择和相似组结构决定要看哪些照片。'
+          '不要固定审片张数。大脑必须至少通过审片板看过整批；单张高清精看用于精选、疑难、闭眼/表情争议和组内代表候选。',
+          'featured 是交付级精选/封面候选，不是“有一点候选价值”。如果整批都很差，可以 0 张或极少张 featured。普通有情绪但背景杂、逆光灰雾、主体糊、构图随拍的照片应归 similarBursts/eyeReview/technical，而不是 featured。',
+          'recommendedAction=maybe/review 的照片默认不是 featured；除非高清单张确认达到交付级，否则只能作为备选或复核。',
+          '每张照片结果要保留 reviewSource：sheet_vision 表示审片板看过，single_vision 表示单张高清看过，group_vision 表示组比较判断。'
         ].join('\n')
       : ''
   ].filter(Boolean).join('\n');
@@ -86,6 +99,8 @@ function toolProductCopy(toolName: string): { phase: BrainUiLogEvent['phase']; t
     GetWorkspaceContext: { phase: 'workspace', title: '读取工作台状态' },
     GetBatchOverview: { phase: 'understanding', title: '理解整批照片', message: '正在汇总质量分布、风险标签、人工选择和连拍结构。' },
     DecideReviewStrategy: { phase: 'planning', title: '制定审片策略', message: '正在决定哪些照片需要看图、哪些连拍组需要比较。' },
+    CreateReviewContactSheets: { phase: 'vision', title: '生成整批审片板', message: '正在把整批照片排成缩略图墙，方便小宫一次覆盖全部素材。' },
+    ReviewContactSheetWithVision: { phase: 'vision', title: '查看审片板', message: '小宫正在通过缩略图墙扫完整批照片。' },
     GetCurrentPhoto: { phase: 'understanding', title: '读取当前照片' },
     GenerateLocalCandidates: { phase: 'planning', title: '整理候选线索' },
     ReviewPhotoWithVision: { phase: 'vision', title: '查看照片画面' },
@@ -102,6 +117,13 @@ function toolProductCopy(toolName: string): { phase: BrainUiLogEvent['phase']; t
     DeleteOriginalFiles: { phase: 'confirmation', title: '准备删除原片' }
   };
   return copy[toolName] || { phase: 'tool', title: '执行小宫动作' };
+}
+
+function shouldAbortSiblingToolCalls(result: BrainToolResult): boolean {
+  if (!result.isError) return false;
+  if (result.toolName === 'ReviewContactSheetWithVision') return true;
+  if (result.toolName === 'ReviewPhotoWithVision' && result.content.includes('vision_payload_or_network_failure')) return true;
+  return false;
 }
 
 export async function runSenseFrameBrainRuntime(
@@ -128,7 +150,16 @@ export async function runSenseFrameBrainRuntime(
   const emitLog = (event: Omit<BrainUiLogEvent, 'id' | 'sessionId' | 'createdAt' | 'traceId'>, status: XiaogongProgressEvent['status'] = 'running'): void => {
     const uiLog = makeUiLog(sessionId, traceId, event);
     appendTrace(traceId, 'ui_log', uiLog);
-    onProgress?.(toProgress(uiLog, status));
+    touchBrainSession(sessionId, uiLog.message || uiLog.title);
+    try {
+      onProgress?.(toProgress(uiLog, status));
+    } catch (error) {
+      appendTrace(traceId, 'progress.delivery_failed', {
+        status,
+        title: uiLog.title,
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
   };
 
   const context: BrainToolContext = {
@@ -178,6 +209,11 @@ export async function runSenseFrameBrainRuntime(
   function captureToolOutput(toolName: string, output: any): void {
     if (toolName === 'ReviewPhotoWithVision' && output?.review?.photoId) {
       photoReviewDrafts.set(output.review.photoId, output.review as BrainPhotoReviewDraft);
+    }
+    if (toolName === 'ReviewContactSheetWithVision' && Array.isArray(output?.reviews)) {
+      for (const review of output.reviews) {
+        if (review?.photoId) photoReviewDrafts.set(review.photoId, review as BrainPhotoReviewDraft);
+      }
     }
     if (toolName === 'CompareSimilarGroupWithVision' && output?.groupReview?.groupId) {
       groupReviewDrafts.set(output.groupReview.groupId, output.groupReview as BrainGroupReviewDraft);
@@ -316,7 +352,8 @@ export async function runSenseFrameBrainRuntime(
 
     if (toolCalls.length) {
       messages.push(message);
-      for (const call of toolCalls) {
+      for (let index = 0; index < toolCalls.length; index += 1) {
+        const call = toolCalls[index];
         const toolName = String(call.function?.name || '');
         const tool = toolMap.get(toolName);
         const argsText = String(call.function?.arguments || '{}');
@@ -333,6 +370,42 @@ export async function runSenseFrameBrainRuntime(
         }
         const result = await executeTool(tool, call.id, input);
         messages.push({ role: 'tool', tool_call_id: call.id, content: toolResultContent(result) });
+        if (shouldAbortSiblingToolCalls(result)) {
+          const remaining = toolCalls.slice(index + 1);
+          for (const sibling of remaining) {
+            const siblingName = String(sibling.function?.name || '');
+            const siblingTool = toolMap.get(siblingName);
+            const siblingResult: BrainToolResult = {
+              toolCallId: sibling.id,
+              toolName: siblingName,
+              isError: true,
+              content: [
+                `同批前序工具 ${result.toolName} 失败，已取消本轮后续工具 ${siblingName}。`,
+                '这不是最终失败；请根据前一个 tool_use_error 的 payload 指标重新规划，例如压缩、拆分、降低 detail、只重建失败 photoIds 后继续补齐视觉覆盖。'
+              ].join('\n')
+            };
+            messages.push({ role: 'tool', tool_call_id: sibling.id, content: toolResultContent(siblingResult) });
+            appendTrace(traceId, 'tool.aborted', { tool: siblingName, reason: `sibling_failed:${result.toolName}` });
+            if (siblingTool) {
+              const aborted = {
+                toolName: siblingTool.name,
+                permissionLevel: siblingTool.permissionLevel,
+                requiresConfirmation: siblingTool.requiresConfirmation,
+                status: 'skipped' as const
+              };
+              toolEvents.push(aborted);
+              recordBrainToolEvent(sessionId, aborted, undefined, undefined, siblingResult.content);
+            }
+          }
+          emitLog({
+            level: 'info',
+            phase: 'tool',
+            title: '等待小宫重新规划',
+            message: `${result.toolName} 失败，本轮后续 ${remaining.length} 个工具已取消，交回大脑根据失败反馈继续判断。`,
+            toolName: result.toolName
+          });
+          break;
+        }
       }
       continue;
     }

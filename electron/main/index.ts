@@ -5,10 +5,20 @@ import { is } from '@electron-toolkit/utils';
 import { loadLocalEnv } from './env';
 import { analyzeSemantic, semanticSearch } from './openaiService';
 import { recordBrainFeedback } from './brainService';
+import { failInterruptedBrainSessions } from './brainRuntime/sessionStore';
 import { startBrainReviewThroughRuntime } from './brainReviewOrchestrator';
 import { runXiaogongTask } from './xiaogongOrchestrator';
 import { getSmartView, listSmartViews } from './xiaogongSmartViewService';
 import { deleteBatch, getBatch, importSource, listBatches, reanalyzeBatch, rebuildClusters, saveDecision, workerHint } from './photoPipeline';
+
+function sendProgress(event: Electron.IpcMainInvokeEvent, channel: string, payload: unknown): void {
+  try {
+    if (!event.sender.isDestroyed()) event.sender.send(channel, payload);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[SenseFrame] skip ${channel} progress delivery: ${message}`);
+  }
+}
 
 function getAppIconPath(): string {
   return join(app.getAppPath(), 'build/icon.png');
@@ -52,6 +62,8 @@ protocol.registerSchemesAsPrivileged([{ scheme: 'senseframe', privileges: { stan
 
 app.whenReady().then(() => {
   loadLocalEnv();
+  const interruptedSessions = failInterruptedBrainSessions();
+  if (interruptedSessions) console.warn(`[SenseFrame] marked ${interruptedSessions} interrupted Xiaogong sessions as failed`);
   applyDockIcon();
   protocol.handle('senseframe', async (request) => {
     const filePath = new URL(request.url).searchParams.get('path');
@@ -87,7 +99,7 @@ app.whenReady().then(() => {
   });
   ipcMain.handle('library:importSource', async (event, source: string) =>
     importSource(source, (progress) => {
-      event.sender.send('library:importProgress', progress);
+      sendProgress(event, 'library:importProgress', progress);
     })
   );
   ipcMain.handle('library:listBatches', async () => listBatches());
@@ -104,11 +116,11 @@ app.whenReady().then(() => {
   ipcMain.handle('ai:analyzeSemantic', async (_event, payload: { batchId: string; photoId: string }) => analyzeSemantic(payload.batchId, payload.photoId));
   ipcMain.handle('ai:search', async (_event, payload: { batchId: string; query: string }) => semanticSearch(payload.batchId, payload.query));
   ipcMain.handle('brain:startReview', async (event, payload) => startBrainReviewThroughRuntime(payload, (progress) => {
-    event.sender.send('brain:progress', progress);
+    sendProgress(event, 'brain:progress', progress);
   }));
   ipcMain.handle('brain:feedback', async (_event, payload) => recordBrainFeedback(payload));
   ipcMain.handle('xiaogong:run', async (event, payload) => runXiaogongTask(payload, (progress) => {
-    event.sender.send('xiaogong:progress', progress);
+    sendProgress(event, 'xiaogong:progress', progress);
   }));
   ipcMain.handle('xiaogong:getSmartView', async (_event, viewId: string) => getSmartView(viewId));
   ipcMain.handle('xiaogong:listSmartViews', async (_event, batchId: string) => listSmartViews(batchId));

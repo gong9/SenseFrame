@@ -3,6 +3,8 @@ import { getDb } from '../db';
 import { getBatch } from '../photoPipeline';
 import { buildBatchContext, bucketCounts, callVisionModel, createHeuristicReview, parseReview, saveReview } from '../brainService';
 import { callChatCompletions, getModelConfig } from '../brainRuntime/modelProvider';
+import { photoAestheticPrompt } from '../brainRuntime/photoAestheticRubric';
+import { createReviewContactSheets, imageFileDataUrl, type ReviewContactSheet, type ReviewContactSheetOptions } from '../brainReviewSheets';
 import { createSmartView, getSmartView } from '../xiaogongSmartViewService';
 import type {
   BatchView,
@@ -11,12 +13,63 @@ import type {
   BrainPhotoReview,
   BrainPhotoReviewDraft,
   BrainReviewStrategy,
+  BrainVisualScores,
   Cluster,
   Decision,
   PhotoView,
   SmartViewItem
 } from '../../shared/types';
 import type { BrainToolDefinition } from '../brainRuntime/types';
+
+const reviewSheetCache = new Map<string, ReviewContactSheet[]>();
+
+function storeReviewSheets(batchId: string, sheets: ReviewContactSheet[]): void {
+  const byId = new Map((reviewSheetCache.get(batchId) || []).map((sheet) => [sheet.id, sheet]));
+  for (const sheet of sheets) byId.set(sheet.id, sheet);
+  reviewSheetCache.set(batchId, [...byId.values()]);
+}
+
+function sheetPayloadSummary(sheet: ReviewContactSheet): Record<string, unknown> {
+  return {
+    sheetId: sheet.id,
+    cells: sheet.cells.length,
+    imageWidth: sheet.imageWidth,
+    imageHeight: sheet.imageHeight,
+    fileSizeBytes: sheet.fileSizeBytes,
+    base64ApproxBytes: sheet.base64ApproxBytes,
+    params: sheet.params,
+    photoIds: sheet.cells.map((cell) => cell.photoId)
+  };
+}
+
+function recoverableVisionSheetError(sheet: ReviewContactSheet, message: string): string {
+  return JSON.stringify({
+    errorType: 'vision_payload_or_network_failure',
+    message,
+    failedSheet: sheetPayloadSummary(sheet),
+    recoveryHints: [
+      '这通常说明当前审片板视觉请求在网络、请求体或模型视觉通道上不稳定。',
+      '不要放弃全批覆盖，也不要只看少量候选。',
+      '可以调用 CreateReviewContactSheets，仅传 failedSheet.photoIds，并主动降低 cellsPerSheet、cellWidth、cellHeight、imageHeight、jpegQuality，或改 detail=low，然后继续 ReviewContactSheetWithVision。',
+      '如果仍失败，可以进一步拆小 failedSheet.photoIds，直到覆盖完成。'
+    ]
+  }, null, 2);
+}
+
+function contactSheetOptionsFromInput(input: any, batch: BatchView): ReviewContactSheetOptions {
+  const known = new Set(batch.photos.map((photo) => photo.id));
+  return {
+    photoIds: Array.isArray(input?.photoIds) ? input.photoIds.map(String).filter((id: string) => known.has(id)) : undefined,
+    cellsPerSheet: input?.cellsPerSheet,
+    columns: input?.columns,
+    cellWidth: input?.cellWidth,
+    cellHeight: input?.cellHeight,
+    imageHeight: input?.imageHeight,
+    jpegQuality: input?.jpegQuality,
+    detail: input?.detail === 'high' ? 'high' : input?.detail === 'low' ? 'low' : undefined,
+    idPrefix: input?.idPrefix
+  };
+}
 
 function now(): string {
   return new Date().toISOString();
@@ -59,6 +112,10 @@ function photoSummary(photo: PhotoView): Record<string, unknown> {
       reason: photo.brainReview.reason,
       needsHumanReview: photo.brainReview.needsHumanReview,
       visualScores: photo.brainReview.visualScores,
+      aestheticPass: photo.brainReview.aestheticPass,
+      aestheticRejectReasons: photo.brainReview.aestheticRejectReasons,
+      fatalFlaws: photo.brainReview.fatalFlaws,
+      compositionTags: photo.brainReview.compositionTags,
       groupId: photo.brainReview.groupId,
       groupRank: photo.brainReview.groupRank,
       groupRole: photo.brainReview.groupRole,
@@ -182,9 +239,9 @@ function normalizeAction(value: unknown): Decision | 'review' {
   return value === 'pick' || value === 'reject' || value === 'maybe' || value === 'none' || value === 'review' ? value : 'review';
 }
 
-function normalizeBucket(value: unknown): BrainBucket {
+function normalizeBucket(value: unknown, fallback: BrainBucket = 'pending'): BrainBucket {
   const buckets: BrainBucket[] = ['featured', 'closedEyes', 'eyeReview', 'subject', 'technical', 'duplicates', 'similarBursts', 'pending'];
-  return buckets.includes(value as BrainBucket) ? value as BrainBucket : 'pending';
+  return buckets.includes(value as BrainBucket) ? value as BrainBucket : fallback;
 }
 
 function draftToReview(draft: BrainPhotoReviewDraft, runId: string, model: string, group?: BrainGroupReviewDraft): BrainPhotoReview {
@@ -200,13 +257,52 @@ function draftToReview(draft: BrainPhotoReviewDraft, runId: string, model: strin
     smallModelOverrides: draft.smallModelOverrides,
     needsHumanReview: draft.needsHumanReview,
     visualScores: draft.visualScores,
+    aestheticPass: draft.aestheticPass,
+    aestheticRejectReasons: draft.aestheticRejectReasons,
+    fatalFlaws: draft.fatalFlaws,
+    compositionTags: draft.compositionTags,
     groupId: group?.groupId,
     groupRank: role?.groupRank,
     groupRole: role?.groupRole,
     representativeRank: role?.groupRank,
     groupReason: group?.groupReason,
+    reviewSource: draft.reviewSource || 'single_vision',
+    sheetId: draft.sheetId,
+    sheetCell: draft.sheetCell,
     model,
     createdAt: now()
+  };
+}
+
+function reviewToDraft(review: BrainPhotoReview, source: BrainPhotoReviewDraft['reviewSource']): BrainPhotoReviewDraft {
+  return {
+    photoId: review.photoId,
+    primaryBucket: review.primaryBucket,
+    secondaryBuckets: review.secondaryBuckets,
+    confidence: review.confidence,
+    recommendedAction: review.recommendedAction,
+    reason: review.reason,
+    smallModelOverrides: review.smallModelOverrides,
+    needsHumanReview: review.needsHumanReview,
+    visualScores: review.visualScores,
+    aestheticPass: review.aestheticPass,
+    aestheticRejectReasons: review.aestheticRejectReasons,
+    fatalFlaws: review.fatalFlaws,
+    compositionTags: review.compositionTags,
+    reviewSource: source
+  };
+}
+
+function sheetFallbackDraft(photo: PhotoView, sheet: ReviewContactSheet, cell: number, model: string): BrainPhotoReviewDraft {
+  const context = buildBatchContext(photo.batchId);
+  const local = createHeuristicReview(photo, 'draft', model, context);
+  return {
+    ...reviewToDraft(local, 'sheet_vision'),
+    confidence: Math.min(local.confidence, 0.56),
+    reason: `大脑已通过审片板覆盖到这张照片，但没有在结构化结果中单独点名；暂按本地信号进入 ${local.primaryBucket}，需要后续单张复核。`,
+    needsHumanReview: true,
+    sheetId: sheet.id,
+    sheetCell: cell
   };
 }
 
@@ -222,6 +318,225 @@ function parseJsonObject(text: string): Record<string, any> {
     const match = text.match(/\{[\s\S]*\}/);
     return match ? JSON.parse(match[0]) : {};
   }
+}
+
+function readableModelText(value: unknown, fallback = ''): string {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (value && typeof value === 'object') {
+    try {
+      const item = value as Record<string, unknown>;
+      const subject = item.flag || item.source || item.from || item.field || item.model || item.type;
+      const override = item.override || item.to || item.result || item.action || item.decision;
+      const reason = item.reason || item.why || item.note;
+      const parts = [subject, override, reason].filter((part) => part !== undefined && part !== null && String(part).trim());
+      if (parts.length) return parts.map(String).join('：');
+      return JSON.stringify(value);
+    } catch {
+      return fallback;
+    }
+  }
+  return fallback;
+}
+
+function normalizeTextList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => readableModelText(item)).filter((item) => item.length > 0);
+}
+
+function clamp01(value: unknown, fallback = 0.5): number {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(0, Math.min(1, num));
+}
+
+function scoreFallback(photo?: PhotoView): number {
+  if (!photo) return 0.58;
+  const analysis = photo.analysis;
+  if (!analysis) return 0.58;
+  const flags = new Set(analysis.riskFlags || []);
+  let score = analysis.finalScore ?? 0.58;
+  if (flags.has('closed_eyes')) score -= 0.2;
+  if (flags.has('eyes_uncertain')) score -= 0.06;
+  if (flags.has('face_missing')) score -= 0.08;
+  if (flags.has('face_blur')) score -= 0.06;
+  if (flags.has('possible_blur')) score -= 0.1;
+  if (analysis.eyeState === 'open') score += 0.03;
+  if (analysis.faceVisibility === 'visible') score += 0.02;
+  return Math.max(0.22, Math.min(0.9, score));
+}
+
+function normalizeScores(input: unknown, photo?: PhotoView): BrainVisualScores {
+  const fallback = scoreFallback(photo);
+  const scores = {
+    visualQuality: clamp01((input as any)?.visualQuality ?? (input as any)?.visual_quality, fallback),
+    expression: clamp01((input as any)?.expression, fallback),
+    moment: clamp01((input as any)?.moment, fallback),
+    composition: clamp01((input as any)?.composition, fallback),
+    backgroundCleanliness: clamp01((input as any)?.backgroundCleanliness ?? (input as any)?.background_cleanliness, fallback),
+    storyValue: clamp01((input as any)?.storyValue ?? (input as any)?.story_value, fallback),
+    lighting: (input as any)?.lighting === undefined ? undefined : clamp01((input as any)?.lighting, fallback),
+    subjectClarity: (input as any)?.subjectClarity === undefined && (input as any)?.subject_clarity === undefined ? undefined : clamp01((input as any)?.subjectClarity ?? (input as any)?.subject_clarity, fallback),
+    finish: (input as any)?.finish === undefined ? undefined : clamp01((input as any)?.finish, fallback),
+    deliverableScore: (input as any)?.deliverableScore === undefined && (input as any)?.deliverable_score === undefined ? undefined : clamp01((input as any)?.deliverableScore ?? (input as any)?.deliverable_score, fallback)
+  };
+  const values = Object.values(scores).filter((value): value is number => typeof value === 'number');
+  const allFlat = values.every((value) => value === values[0]);
+  const allExtreme = values.every((value) => value >= 0.99) || values.every((value) => value <= 0.01);
+  if (allFlat && allExtreme) {
+    return {
+      visualQuality: fallback,
+      expression: Math.min(1, fallback + 0.08),
+      moment: Math.min(1, fallback + 0.05),
+      composition: fallback,
+      backgroundCleanliness: Math.max(0.2, fallback - 0.02),
+      storyValue: Math.min(1, fallback + 0.04)
+    };
+  }
+  return scores;
+}
+
+function hasCriticalRisk(photo?: PhotoView): boolean {
+  const flags = new Set(photo?.analysis?.riskFlags || []);
+  return flags.has('closed_eyes') || flags.has('face_missing') || flags.has('face_blur') || flags.has('possible_blur') || flags.has('subject_cropped_severe');
+}
+
+function aestheticPassFromRaw(raw: any, scores: BrainVisualScores): boolean | undefined {
+  if (typeof raw?.aestheticPass === 'boolean') return raw.aestheticPass;
+  if (typeof raw?.aesthetic_pass === 'boolean') return raw.aesthetic_pass;
+  if (typeof raw?.aestheticPass === 'string') return raw.aestheticPass.toLowerCase() === 'true';
+  if (typeof raw?.aesthetic_pass === 'string') return raw.aesthetic_pass.toLowerCase() === 'true';
+  if (typeof scores.deliverableScore === 'number') return scores.deliverableScore >= 0.76;
+  return undefined;
+}
+
+function fatalFlawsFromRaw(raw: any): string[] {
+  return normalizeTextList(raw?.fatalFlaws || raw?.fatal_flaws);
+}
+
+function rejectReasonsFromRaw(raw: any): string[] {
+  return normalizeTextList(raw?.aestheticRejectReasons || raw?.aesthetic_reject_reasons);
+}
+
+function compositionTagsFromRaw(raw: any): string[] {
+  return normalizeTextList(raw?.compositionTags || raw?.composition_tags)
+    .map((item) => item.trim())
+    .filter((item, index, array) => item && array.indexOf(item) === index);
+}
+
+function curationScore(scores: BrainVisualScores): number {
+  const delivery = typeof scores.deliverableScore === 'number' ? scores.deliverableScore : scores.visualQuality;
+  const lighting = typeof scores.lighting === 'number' ? scores.lighting : scores.visualQuality;
+  const subject = typeof scores.subjectClarity === 'number' ? scores.subjectClarity : scores.visualQuality;
+  const finish = typeof scores.finish === 'number' ? scores.finish : scores.visualQuality;
+  return scores.visualQuality * 0.12
+    + scores.expression * 0.18
+    + scores.moment * 0.16
+    + scores.composition * 0.17
+    + scores.backgroundCleanliness * 0.14
+    + scores.storyValue * 0.07
+    + delivery * 0.08
+    + lighting * 0.03
+    + subject * 0.03
+    + finish * 0.02;
+}
+
+function standoutCount(scores: BrainVisualScores): number {
+  return [scores.expression, scores.moment, scores.composition, scores.storyValue].filter((score) => score >= 0.82).length;
+}
+
+function featuredWorthy(input: {
+  action: Decision | 'review';
+  confidence: number;
+  scores: BrainVisualScores;
+  source?: BrainPhotoReview['reviewSource'];
+  aestheticPass?: boolean;
+  fatalFlaws?: string[];
+}): boolean {
+  if (input.action !== 'pick') return false;
+  if (input.aestheticPass === false) return false;
+  if ((input.fatalFlaws || []).length > 0) return false;
+  const deliverable = input.scores.deliverableScore ?? curationScore(input.scores);
+  const sourceThreshold = input.source === 'sheet_vision' ? 0.84 : 0.78;
+  if (input.confidence < (input.source === 'sheet_vision' ? 0.8 : 0.74)) return false;
+  if (deliverable < (input.source === 'sheet_vision' ? 0.8 : 0.76)) return false;
+  if (curationScore(input.scores) < sourceThreshold) return false;
+  if (input.scores.visualQuality < 0.7 || input.scores.composition < 0.7) return false;
+  if ((input.scores.subjectClarity ?? input.scores.visualQuality) < 0.68) return false;
+  if ((input.scores.finish ?? input.scores.visualQuality) < 0.66) return false;
+  if (input.scores.backgroundCleanliness < 0.62 && standoutCount(input.scores) < 3) return false;
+  return standoutCount(input.scores) >= 2;
+}
+
+function demoteWeakFeatured(
+  bucket: BrainBucket,
+  action: Decision | 'review',
+  confidence: number,
+  scores: BrainVisualScores,
+  photo: PhotoView,
+  source?: BrainPhotoReview['reviewSource'],
+  aestheticPass?: boolean,
+  fatalFlaws?: string[]
+): BrainBucket {
+  if (bucket !== 'featured') return bucket;
+  if (featuredWorthy({ action, confidence, scores, source, aestheticPass, fatalFlaws })) return 'featured';
+  if (action === 'review') return hasCriticalRisk(photo) ? 'eyeReview' : 'similarBursts';
+  if (action === 'reject') return hasCriticalRisk(photo) ? 'technical' : 'similarBursts';
+  return hasCriticalRisk(photo) ? 'eyeReview' : 'similarBursts';
+}
+
+function needsHumanReviewFromDraft(draft: any, photo?: PhotoView, source?: BrainPhotoReview['reviewSource']): boolean {
+  const action = String(draft?.recommendedAction || draft?.recommended_action || '').toLowerCase();
+  const bucket = String(draft?.primaryBucket || draft?.primary_bucket || '').toLowerCase();
+  const confidence = clamp01(draft?.confidence ?? 0.5, 0.5);
+  const explicit = Boolean(draft?.needsHumanReview ?? draft?.needs_human_review);
+  if (source === 'single_vision' || source === 'group_vision') return explicit || confidence < 0.7 || action === 'review' || action === 'maybe';
+  if (hasCriticalRisk(photo)) return true;
+  if (action === 'review') return true;
+  if (action === 'reject') return false;
+  if (action === 'pick' && confidence >= 0.8 && !hasCriticalRisk(photo)) return explicit && confidence < 0.88;
+  if (bucket === 'featured' && confidence >= 0.78 && !hasCriticalRisk(photo)) return false;
+  if (bucket === 'eyereview' || bucket === 'technical' || bucket === 'pending') return true;
+  if (action === 'maybe') return confidence < 0.72 || bucket === 'featured';
+  return explicit && confidence < 0.7;
+}
+
+function normalizeDraftReview(raw: any, photo: PhotoView, source: BrainPhotoReview['reviewSource'], fallbackBucket: BrainBucket): BrainPhotoReviewDraft {
+  const rawPrimaryBucket = normalizeBucket(raw?.primaryBucket || raw?.primary_bucket, fallbackBucket);
+  const confidence = clamp01(raw?.confidence, scoreFallback(photo));
+  const scoreInput = {
+    ...((raw?.visualScores || raw?.visual_scores || {}) as Record<string, unknown>),
+    deliverableScore: raw?.deliverableScore ?? raw?.deliverable_score ?? (raw?.visualScores || raw?.visual_scores)?.deliverableScore ?? (raw?.visualScores || raw?.visual_scores)?.deliverable_score
+  };
+  const visualScores = normalizeScores(scoreInput, photo);
+  const recommendedAction = normalizeAction(raw?.recommendedAction || raw?.recommended_action);
+  const aestheticPass = aestheticPassFromRaw(raw, visualScores);
+  const fatalFlaws = fatalFlawsFromRaw(raw);
+  const aestheticRejectReasons = rejectReasonsFromRaw(raw);
+  const compositionTags = compositionTagsFromRaw(raw);
+  const primaryBucket = demoteWeakFeatured(rawPrimaryBucket, recommendedAction, confidence, visualScores, photo, source, aestheticPass, fatalFlaws);
+  const secondaryBuckets = Array.isArray(raw?.secondaryBuckets || raw?.secondary_buckets)
+    ? (raw?.secondaryBuckets || raw?.secondary_buckets).map((item: unknown) => normalizeBucket(item, fallbackBucket)).filter((item: BrainBucket, index: number, array: BrainBucket[]) => array.indexOf(item) === index)
+    : [];
+  if (rawPrimaryBucket === 'featured' && primaryBucket !== 'featured' && !secondaryBuckets.includes('featured')) {
+    secondaryBuckets.unshift('featured');
+  }
+  return {
+    photoId: photo.id,
+    primaryBucket,
+    secondaryBuckets,
+    confidence,
+    recommendedAction,
+    reason: String(raw?.reason || `小宫在 ${source === 'sheet_vision' ? '审片板' : '高清单图'} 中看到了这张照片。`),
+    smallModelOverrides: normalizeTextList(raw?.smallModelOverrides || raw?.small_model_overrides),
+    needsHumanReview: needsHumanReviewFromDraft(raw, photo, source),
+    visualScores,
+    aestheticPass,
+    aestheticRejectReasons,
+    fatalFlaws,
+    compositionTags,
+    reviewSource: source
+  };
 }
 
 export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
@@ -332,6 +647,189 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
           riskPhotoIds,
           groupIdsToCompare: Array.isArray(input?.groupIdsToCompare) ? input.groupIdsToCompare.map(String).filter((id: string) => groupIds.has(id)) : [],
           skipPhotoIds: validatePhotoIds(batch, input?.skipPhotoIds)
+        };
+      }
+    },
+    {
+      name: 'CreateReviewContactSheets',
+      description: '生成覆盖整批或指定照片的审片板。小宫可以主动控制 photoIds、cellsPerSheet、columns、cellWidth、cellHeight、imageHeight、jpegQuality、detail、idPrefix 来优化视觉载体；工具会校验边界并返回真实 payload 指标。',
+      permissionLevel: 'brain_write',
+      requiresConfirmation: false,
+      parameters: {
+        type: 'object',
+        properties: {
+          photoIds: { type: 'array', items: { type: 'string' } },
+          cellsPerSheet: { type: 'number' },
+          columns: { type: 'number' },
+          cellWidth: { type: 'number' },
+          cellHeight: { type: 'number' },
+          imageHeight: { type: 'number' },
+          jpegQuality: { type: 'number' },
+          detail: { type: 'string', enum: ['low', 'high'] },
+          idPrefix: { type: 'string' },
+          strategySummary: { type: 'string' }
+        },
+        additionalProperties: false
+      },
+      handler: async (input, context) => {
+        const batch = getBatch(context.batchId);
+        const sheets = await createReviewContactSheets(context.batchId, batch.photos, contactSheetOptionsFromInput(input, batch));
+        storeReviewSheets(context.batchId, sheets);
+        context.emitLog({
+          level: 'success',
+          phase: 'vision',
+          title: '生成整批审片板',
+          message: `已生成 ${sheets.length} 张审片板，覆盖 ${sheets.reduce((sum, sheet) => sum + sheet.cells.length, 0)} 张照片。`,
+          progress: { current: sheets.length, total: sheets.length }
+        });
+        return {
+          strategySummary: String(input?.strategySummary || '小宫决定先用审片板全量扫完整批，再挑关键照片高清精看。'),
+          totalPhotos: batch.photos.length,
+          coveredPhotos: sheets.reduce((sum, sheet) => sum + sheet.cells.length, 0),
+          sheets: sheets.map((sheet) => ({
+            id: sheet.id,
+            index: sheet.index,
+            total: sheet.total,
+            photoCount: sheet.cells.length,
+            imageWidth: sheet.imageWidth,
+            imageHeight: sheet.imageHeight,
+            fileSizeBytes: sheet.fileSizeBytes,
+            base64ApproxBytes: sheet.base64ApproxBytes,
+            params: sheet.params,
+            photoIds: sheet.cells.map((cell) => cell.photoId)
+          }))
+        };
+      }
+    },
+    {
+      name: 'ReviewContactSheetWithVision',
+      description: '真实查看一张审片板，并为板上每个 cell/photo 返回初步小宫判断。失败时会返回包含 payload 指标、失败 sheet photoIds 和恢复提示的 tool_use_error，供大脑自己压缩、拆分、重建、重试。',
+      permissionLevel: 'brain_write',
+      requiresConfirmation: false,
+      parameters: {
+        type: 'object',
+        properties: {
+          sheetId: { type: 'string' },
+          sheetPath: { type: 'string' },
+          cells: { type: 'array', items: { type: 'object' } },
+          focusMode: { type: 'string' }
+        },
+        required: ['sheetId'],
+        additionalProperties: false
+      },
+      handler: async (input, context) => {
+        const batch = getBatch(context.batchId);
+        const idToPhoto = new Map(batch.photos.map((photo) => [photo.id, photo]));
+        const sheetId = String(input?.sheetId || '');
+        const cached = reviewSheetCache.get(context.batchId)?.find((item) => item.id === sheetId);
+        const sheet: ReviewContactSheet = cached || {
+          id: sheetId,
+          path: String(input?.sheetPath || ''),
+          index: 1,
+          total: 1,
+          imageWidth: 0,
+          imageHeight: 0,
+          fileSizeBytes: 0,
+          base64ApproxBytes: 0,
+          params: {
+            photoIds: [],
+            cellsPerSheet: 25,
+            columns: 5,
+            cellWidth: 210,
+            cellHeight: 292,
+            imageHeight: 238,
+            jpegQuality: 82,
+            detail: 'low',
+            idPrefix: 'external-sheet'
+          },
+          cells: Array.isArray(input?.cells) ? input.cells.map((cell: any) => ({
+            cell: Number(cell.cell) || 0,
+            photoId: String(cell.photoId || ''),
+            fileName: String(cell.fileName || ''),
+            score: Number(cell.score) || 0,
+            riskFlags: Array.isArray(cell.riskFlags) ? cell.riskFlags.map(String) : [],
+            decision: String(cell.decision || 'none')
+          })).filter((cell: ReviewContactSheet['cells'][number]) => idToPhoto.has(cell.photoId)) : []
+        };
+        if (!sheet.id || !sheet.path || !sheet.cells.length) throw new Error('ReviewContactSheetWithVision 缺少有效审片板。');
+        const config = getModelConfig();
+        let response: any;
+        try {
+          response = await callChatCompletions(config, {
+            response_format: { type: 'json_object' },
+            messages: [
+              {
+                role: 'system',
+                content: [
+                  '你是 SenseFrame 小宫大脑的审片板视觉分析器。',
+                  '你正在像摄影师看缩略图墙一样查看整批照片的一部分。必须尽量给每个 cell/photo 一个初步判断。',
+                  photoAestheticPrompt(),
+                  '不要把本地风险机械等同废片；closed_eyes 可能是情绪，face_missing 可能是细节/空镜。',
+                  '输出 JSON：{reviews:[{cell, photoId, primaryBucket, secondaryBuckets, confidence, recommendedAction, reason, smallModelOverrides, needsHumanReview, visualScores, aestheticPass, deliverableScore, fatalFlaws, aestheticRejectReasons, compositionTags}], sheetSummary, singleVisionPhotoIds}。',
+                  '允许 primaryBucket: featured, closedEyes, eyeReview, subject, technical, duplicates, similarBursts, pending。',
+                  'recommendedAction 只能是 pick/reject/maybe/review/none。visualScores 字段为 visualQuality, expression, moment, composition, backgroundCleanliness, storyValue，可补充 lighting, subjectClarity, finish, deliverableScore。',
+                  'visualScores 必须是 0-1 的真实差异化评分，禁止全部填 1 或全部填同一个数。',
+                  'needsHumanReview 只给真正需要人工复核或高清确认的照片；低优先级备选、明确相似淘汰、普通连拍不要全部标 true。',
+                  'featured 只能给交付级精选候选：动作/表情/构图/背景至少两项明显优秀，且 recommendedAction 必须是 pick。普通“有情绪但画面脏、逆光灰、主体糊、构图随拍”的照片应归 similarBursts/eyeReview/technical。',
+                  '如果这一页整体都是烂片，可以一个 featured 都不给；不要为了凑数而精选。'
+                ].join('\n')
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: [
+                      `sheetId=${sheet.id}`,
+                      `focusMode=${String(input?.focusMode || 'batch')}`,
+                      `payload=${JSON.stringify(sheetPayloadSummary(sheet))}`,
+                      '每个格子底部有 cell 序号、文件名、短 id、本地分数和风险信号。',
+                      '请覆盖这个 sheet 中所有 cell。如果某张只能缩略图初判，请 needsHumanReview=true，并建议是否需要单张高清精看。',
+                      JSON.stringify(sheet.cells, null, 2)
+                    ].join('\n')
+                  },
+                  {
+                    type: 'image_url',
+                    image_url: { url: imageFileDataUrl(sheet.path), detail: sheet.params.detail }
+                  }
+                ]
+              }
+            ]
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new Error(recoverableVisionSheetError(sheet, message));
+        }
+        const parsed = parseJsonObject(String(response.choices?.[0]?.message?.content || '{}'));
+        const byPhoto = new Map<string, any>();
+        for (const review of Array.isArray(parsed.reviews) ? parsed.reviews : []) {
+          const photoId = String(review?.photoId || review?.photo_id || '');
+          if (idToPhoto.has(photoId)) byPhoto.set(photoId, review);
+        }
+        const reviews: BrainPhotoReviewDraft[] = sheet.cells.map((cell) => {
+          const photo = idToPhoto.get(cell.photoId);
+          if (!photo) throw new Error(`审片板包含不存在照片：${cell.photoId}`);
+          const raw = byPhoto.get(cell.photoId);
+          if (!raw) return sheetFallbackDraft(photo, sheet, cell.cell, config.model);
+          return {
+            ...normalizeDraftReview(raw, photo, 'sheet_vision', 'pending'),
+            sheetId: sheet.id,
+            sheetCell: cell.cell
+          };
+        });
+        const sheetSummary = readableModelText(parsed.sheetSummary || parsed.sheet_summary, `已通过审片板覆盖 ${reviews.length} 张照片。`);
+        context.emitLog({
+          level: 'success',
+          phase: 'vision',
+          title: `完成审片板 ${sheet.id}`,
+          message: sheetSummary,
+          progress: { current: reviews.length, total: sheet.cells.length }
+        });
+        return {
+          sheetId: sheet.id,
+          sheetSummary,
+          reviews,
+          singleVisionPhotoIds: validatePhotoIds(batch, parsed.singleVisionPhotoIds || parsed.single_vision_photo_ids)
         };
       }
     },
@@ -481,17 +979,7 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
         });
         const text = await callVisionModel(config, photo, 'photo', batchContext);
         const parsed = parseReview(text, photo, fallback.primaryBucket);
-        const draft: BrainPhotoReviewDraft = {
-          photoId: photo.id,
-          primaryBucket: parsed.primaryBucket,
-          secondaryBuckets: parsed.secondaryBuckets,
-          confidence: parsed.confidence,
-          recommendedAction: parsed.recommendedAction,
-          reason: parsed.reason,
-          smallModelOverrides: parsed.smallModelOverrides,
-          needsHumanReview: parsed.needsHumanReview,
-          visualScores: parsed.visualScores
-        };
+        const draft = normalizeDraftReview(parsed, photo, 'single_vision', fallback.primaryBucket);
         context.emitLog({
           level: 'success',
           phase: 'vision',
@@ -526,16 +1014,21 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
         const reviewMap = new Map<string, BrainPhotoReviewDraft>();
         for (const item of Array.isArray(input?.reviews) ? input.reviews : []) {
           if (item && typeof item === 'object' && typeof item.photoId === 'string') {
+            const photo = idToPhoto.get(item.photoId);
             reviewMap.set(item.photoId, {
               photoId: item.photoId,
               primaryBucket: normalizeBucket(item.primaryBucket),
               secondaryBuckets: Array.isArray(item.secondaryBuckets) ? item.secondaryBuckets.map(normalizeBucket) : [],
-              confidence: Math.max(0, Math.min(1, Number(item.confidence) || 0.5)),
+              confidence: clamp01(item.confidence, 0.5),
               recommendedAction: normalizeAction(item.recommendedAction),
               reason: String(item.reason || ''),
-              smallModelOverrides: Array.isArray(item.smallModelOverrides) ? item.smallModelOverrides.map(String) : [],
-              needsHumanReview: Boolean(item.needsHumanReview),
-              visualScores: item.visualScores || { visualQuality: 0.5, expression: 0.5, moment: 0.5, composition: 0.5, backgroundCleanliness: 0.5, storyValue: 0.5 }
+              smallModelOverrides: normalizeTextList(item.smallModelOverrides),
+              needsHumanReview: needsHumanReviewFromDraft(item, photo, 'group_vision'),
+              visualScores: normalizeScores(item.visualScores, photo),
+              aestheticPass: aestheticPassFromRaw(item, normalizeScores(item.visualScores, photo)),
+              aestheticRejectReasons: rejectReasonsFromRaw(item),
+              fatalFlaws: fatalFlawsFromRaw(item),
+              compositionTags: compositionTagsFromRaw(item)
             });
           }
         }
@@ -556,7 +1049,10 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
           messages: [
             {
               role: 'system',
-              content: '你是 SenseFrame 小宫大脑的连拍/相似组比较器。你不能写数据库，只能基于已有单张视觉复核和本地上下文选择组内代表图。输出 JSON。'
+              content: [
+                '你是 SenseFrame 小宫大脑的连拍/相似组比较器。你不能写数据库，只能基于已有单张视觉复核和本地上下文选择组内代表图。输出 JSON。',
+                photoAestheticPrompt()
+              ].join('\n')
             },
             {
               role: 'user',
@@ -610,7 +1106,7 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
     },
     {
       name: 'WriteBrainReviewResult',
-      description: '写入大脑最终审片结果。只有这个工具可以写 brain_runs、brain_bucket_assignments、brain_group_rankings、brain_events。',
+      description: '写入本次大脑最终审片结果。只有这个工具可以写 brain_runs、brain_bucket_assignments、brain_group_rankings、brain_events。必须传入本次工具链产生的全量 reviews；历史 brainRun/brainReview 不能当作本次结果，空 reviews 会被拒绝。',
       permissionLevel: 'brain_write',
       requiresConfirmation: false,
       parameters: {
@@ -644,23 +1140,30 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
         const groupByPhoto = new Map<string, BrainGroupReviewDraft>();
         for (const group of groupReviews) for (const role of group.roles) groupByPhoto.set(role.photoId, group);
         const known = new Set(batch.photos.map((photo) => photo.id));
+        const photoById = new Map(batch.photos.map((photo) => [photo.id, photo]));
         const reviews: BrainPhotoReview[] = (Array.isArray(input?.reviews) ? input.reviews : [])
           .filter((draft: any) => known.has(String(draft.photoId)))
-          .map((draft: any) => draftToReview({
-            photoId: String(draft.photoId),
-            primaryBucket: normalizeBucket(draft.primaryBucket),
-            secondaryBuckets: Array.isArray(draft.secondaryBuckets) ? draft.secondaryBuckets.map(normalizeBucket) : [],
-            confidence: Math.max(0, Math.min(1, Number(draft.confidence) || 0.5)),
-            recommendedAction: normalizeAction(draft.recommendedAction),
-            reason: String(draft.reason || '大脑未返回明确理由。'),
-            smallModelOverrides: Array.isArray(draft.smallModelOverrides) ? draft.smallModelOverrides.map(String) : [],
-            needsHumanReview: Boolean(draft.needsHumanReview),
-            visualScores: draft.visualScores || { visualQuality: 0.5, expression: 0.5, moment: 0.5, composition: 0.5, backgroundCleanliness: 0.5, storyValue: 0.5 }
-          }, runId, config.model, groupByPhoto.get(String(draft.photoId))));
+          .map((draft: any) => {
+            const photo = photoById.get(String(draft.photoId));
+            if (!photo) throw new Error(`WriteBrainReviewResult 收到不存在照片：${String(draft.photoId)}`);
+            const source = draft.reviewSource === 'sheet_vision' || draft.reviewSource === 'group_vision' || draft.reviewSource === 'single_vision' ? draft.reviewSource : 'single_vision';
+            return draftToReview({
+              ...normalizeDraftReview(draft, photo, source, 'pending'),
+              sheetId: typeof draft.sheetId === 'string' ? draft.sheetId : undefined,
+              sheetCell: Number.isFinite(Number(draft.sheetCell)) ? Number(draft.sheetCell) : undefined
+            }, runId, config.model, groupByPhoto.get(String(draft.photoId)));
+          });
         if (!reviews.length) throw new Error('WriteBrainReviewResult 没有收到有效 reviews，拒绝写入。');
+        const reviewedIds = new Set(reviews.map((review) => review.photoId));
+        const missing = batch.photos.filter((photo) => !reviewedIds.has(photo.id));
+        if (missing.length) {
+          throw new Error(`WriteBrainReviewResult 拒绝只写部分结果：当前缺少 ${missing.length}/${batch.photos.length} 张照片。小宫必须先用 CreateReviewContactSheets + ReviewContactSheetWithVision 覆盖整批，再写入全量结果。缺少示例：${missing.slice(0, 8).map((photo) => photo.fileName).join(', ')}`);
+        }
         const counts = bucketCounts(reviews);
+        const sourceCounts = countBy(reviews.map((review) => review.reviewSource || 'single_vision'));
         const summary = [
           `小宫大脑完成审片：写入 ${reviews.length} 张照片。`,
+          `审片板覆盖 ${sourceCounts.sheet_vision || 0} 张，单张精看 ${sourceCounts.single_vision || 0} 张。`,
           `精选候选 ${counts.featured || 0}，待判断 ${counts.pending || 0}，需要人工复核 ${reviews.filter((review) => review.needsHumanReview).length}。`
         ].join(' ');
         const db = getDb();
@@ -676,9 +1179,9 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
             config.model,
             reviews.length,
             summary,
-            JSON.stringify({ summary: String(input.strategySummary || ''), toolchain: 'harness' }),
+            JSON.stringify({ summary: String(input.strategySummary || ''), toolchain: 'harness', sourceCounts }),
             JSON.stringify(counts),
-            JSON.stringify({ totalPhotos: batch.photos.length }),
+            JSON.stringify({ totalPhotos: batch.photos.length, sourceCounts }),
             createdAt,
             createdAt
           );
@@ -695,7 +1198,7 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
             }
           }
           db.prepare('INSERT INTO brain_events (id, run_id, event_type, message, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-            .run(crypto.randomUUID(), runId, 'run.completed', summary, JSON.stringify({ counts, groupReviews: groupReviews.length }), createdAt);
+            .run(crypto.randomUUID(), runId, 'run.completed', summary, JSON.stringify({ counts, sourceCounts, groupReviews: groupReviews.length }), createdAt);
         });
         tx();
         context.emitLog({

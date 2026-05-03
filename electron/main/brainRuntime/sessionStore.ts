@@ -38,6 +38,29 @@ export function finishBrainSession(input: {
     );
 }
 
+export function touchBrainSession(sessionId: string, summary?: string): void {
+  if (summary && summary.trim()) {
+    getDb()
+      .prepare('UPDATE xiaogong_sessions SET summary = ?, updated_at = ? WHERE id = ? AND status = ?')
+      .run(summary.trim(), now(), sessionId, 'running');
+    return;
+  }
+  getDb()
+    .prepare('UPDATE xiaogong_sessions SET updated_at = ? WHERE id = ? AND status = ?')
+    .run(now(), sessionId, 'running');
+}
+
+export function failInterruptedBrainSessions(summary = '上次小宫任务已中断。'): number {
+  const result = getDb()
+    .prepare(`
+      UPDATE xiaogong_sessions
+      SET status = 'failed', summary = ?, updated_at = ?
+      WHERE status = 'running'
+    `)
+    .run(summary, now());
+  return Number(result.changes || 0);
+}
+
 export function recordBrainToolEvent(sessionId: string, event: XiaogongToolEventSummary, input: unknown, output?: unknown, error?: string): void {
   getDb()
     .prepare(`
