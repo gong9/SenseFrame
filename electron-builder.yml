@@ -35,9 +35,5 @@ nsis:
   perMachine: false
   allowToChangeInstallationDirectory: true
 
-publish:
-  provider: github
-  releaseType: draft
-
 npmRebuild: true
 nativeRebuilder: sequential

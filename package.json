@@ -1,6 +1,6 @@
 {
   "name": "senseframe",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "AI photo culling desktop app for professional photographers.",
   "type": "module",
@@ -8,9 +8,9 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "tsc --noEmit && electron-vite build",
-    "dist": "pnpm run build && electron-builder",
-    "dist:mac": "pnpm run build && electron-builder --mac",
-    "dist:win": "pnpm run build && electron-builder --win",
+    "dist": "pnpm run build && electron-builder --publish never",
+    "dist:mac": "pnpm run build && electron-builder --mac --publish never",
+    "dist:win": "pnpm run build && electron-builder --win --publish never",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit"
   },
