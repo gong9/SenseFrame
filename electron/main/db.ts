@@ -116,8 +116,131 @@ function migrate(database: Database.Database): void {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS brain_runs (
+      id TEXT PRIMARY KEY,
+      batch_id TEXT NOT NULL,
+      scope TEXT NOT NULL,
+      status TEXT NOT NULL,
+      model TEXT NOT NULL,
+      debug_log_path TEXT,
+      error TEXT,
+      reviewed_count INTEGER NOT NULL DEFAULT 0,
+      summary TEXT,
+      strategy_json TEXT,
+      bucket_counts_json TEXT,
+      input_snapshot_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS brain_events (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      message TEXT NOT NULL,
+      payload TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS brain_bucket_assignments (
+      photo_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      batch_id TEXT NOT NULL,
+      primary_bucket TEXT NOT NULL,
+      secondary_buckets TEXT NOT NULL,
+      confidence REAL NOT NULL,
+      recommended_action TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      small_model_overrides TEXT NOT NULL,
+      needs_human_review INTEGER NOT NULL,
+      visual_scores TEXT NOT NULL,
+      representative_rank INTEGER,
+      group_reason TEXT,
+      group_id TEXT,
+      group_rank INTEGER,
+      group_role TEXT,
+      model TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS brain_group_rankings (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      batch_id TEXT NOT NULL,
+      group_type TEXT NOT NULL,
+      group_key TEXT NOT NULL,
+      photo_id TEXT NOT NULL,
+      rank INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS brain_feedback (
+      id TEXT PRIMARY KEY,
+      photo_id TEXT NOT NULL,
+      run_id TEXT,
+      action TEXT NOT NULL,
+      note TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS xiaogong_sessions (
+      id TEXT PRIMARY KEY,
+      batch_id TEXT NOT NULL,
+      user_message TEXT NOT NULL,
+      intent TEXT NOT NULL,
+      status TEXT NOT NULL,
+      summary TEXT,
+      ui_patch_json TEXT,
+      created_view_id TEXT,
+      requires_confirmation INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS xiaogong_tool_events (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      permission_level TEXT NOT NULL,
+      requires_confirmation INTEGER NOT NULL,
+      input_json TEXT NOT NULL,
+      output_json TEXT,
+      status TEXT NOT NULL,
+      error TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS smart_views (
+      id TEXT PRIMARY KEY,
+      batch_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      source TEXT NOT NULL,
+      intent TEXT NOT NULL,
+      query TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      photo_count INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS smart_view_items (
+      view_id TEXT NOT NULL,
+      photo_id TEXT NOT NULL,
+      rank INTEGER NOT NULL,
+      score REAL NOT NULL,
+      reason TEXT NOT NULL,
+      action_hint TEXT,
+      needs_human_review INTEGER NOT NULL,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      PRIMARY KEY(view_id, photo_id)
+    );
   `);
   ensurePhotoAnalysisColumns(database);
+  ensureBrainColumns(database);
 }
 
 function ensurePhotoAnalysisColumns(database: Database.Database): void {
@@ -132,5 +255,26 @@ function ensurePhotoAnalysisColumns(database: Database.Database): void {
   ];
   for (const [name, definition] of additions) {
     if (!columns.has(name)) database.exec(`ALTER TABLE photo_analysis ADD COLUMN ${name} ${definition}`);
+  }
+}
+
+function ensureBrainColumns(database: Database.Database): void {
+  ensureColumns(database, 'brain_runs', [
+    ['summary', 'TEXT'],
+    ['strategy_json', 'TEXT'],
+    ['bucket_counts_json', 'TEXT'],
+    ['input_snapshot_json', 'TEXT']
+  ]);
+  ensureColumns(database, 'brain_bucket_assignments', [
+    ['group_id', 'TEXT'],
+    ['group_rank', 'INTEGER'],
+    ['group_role', 'TEXT']
+  ]);
+}
+
+function ensureColumns(database: Database.Database, table: string, additions: Array<[string, string]>): void {
+  const columns = new Set((database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name));
+  for (const [name, definition] of additions) {
+    if (!columns.has(name)) database.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
   }
 }

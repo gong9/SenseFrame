@@ -10,6 +10,8 @@ export type RiskFlag =
   | 'face_blur'
   | 'face_missing'
   | 'subject_cropped'
+  | 'subject_cropped_mild'
+  | 'subject_cropped_severe'
   | 'weak_subject'
   | 'unsupported_preview'
   | 'raw_decode_failed'
@@ -105,6 +107,7 @@ export type Cluster = {
 export type PhotoView = Photo & {
   analysis?: PhotoAnalysis;
   semantic?: SemanticAnalysis;
+  brainReview?: BrainPhotoReview;
   decision: Decision;
   rating?: number;
   clusterId?: string;
@@ -122,6 +125,7 @@ export type BatchView = {
   createdAt: string;
   photos: PhotoView[];
   clusters: Cluster[];
+  brainRun?: BrainRunSummary;
 };
 
 export type ImportResult = {
@@ -148,4 +152,292 @@ export type SearchResult = {
   photo: PhotoView;
   score: number;
   reason: string;
+};
+
+export type XiaogongIntentType =
+  | 'best_photos'
+  | 'cover_candidates'
+  | 'closed_eye_misread'
+  | 'group_representatives'
+  | 'explain_current_photo'
+  | 'batch_review'
+  | 'unknown';
+
+export type SmartViewItem = {
+  photoId: string;
+  rank: number;
+  score: number;
+  reason: string;
+  actionHint?: Decision | 'review';
+  needsHumanReview: boolean;
+};
+
+export type SmartView = {
+  id: string;
+  batchId: string;
+  name: string;
+  source: 'xiaogong';
+  intent: XiaogongIntentType;
+  query: string;
+  summary: string;
+  items: SmartViewItem[];
+  createdAt: string;
+};
+
+export type SmartViewSummary = {
+  id: string;
+  batchId: string;
+  name: string;
+  intent: XiaogongIntentType;
+  photoCount: number;
+  summary: string;
+  createdAt: string;
+};
+
+export type XiaogongRunRequest = {
+  batchId: string;
+  message: string;
+  currentMode?: string;
+  activePhotoId?: string;
+  smartViewId?: string;
+};
+
+export type XiaogongUiPatch = {
+  mode?: 'smartView';
+  smartViewId?: string;
+  activePhotoId?: string;
+  notice?: string;
+};
+
+export type BrainUiLogEvent = {
+  id: string;
+  sessionId: string;
+  runId?: string;
+  level: 'info' | 'success' | 'warning' | 'error' | 'question';
+  phase:
+    | 'understanding'
+    | 'workspace'
+    | 'planning'
+    | 'tool'
+    | 'vision'
+    | 'compare'
+    | 'write'
+    | 'ui'
+    | 'confirmation'
+    | 'done'
+    | 'failed';
+  title: string;
+  message?: string;
+  toolName?: string;
+  photoId?: string;
+  photoFileName?: string;
+  groupId?: string;
+  progress?: {
+    current: number;
+    total: number;
+  };
+  artifactId?: string;
+  traceId?: string;
+  createdAt: string;
+};
+
+export type XiaogongToolEventSummary = {
+  toolName: string;
+  permissionLevel: 'read' | 'view' | 'brain_write' | 'decision_write' | 'export' | 'destructive';
+  status: 'completed' | 'failed' | 'skipped';
+  requiresConfirmation: boolean;
+};
+
+export type BrainArtifact = {
+  id: string;
+  type: 'smart_view' | 'brain_run' | 'photo_explanation' | 'candidate_list' | 'confirmation';
+  title: string;
+  summary?: string;
+  refId?: string;
+};
+
+export type BrainStateWrite = {
+  target: 'brain_runs' | 'brain_bucket_assignments' | 'brain_group_rankings' | 'smart_views' | 'smart_view_items' | 'xiaogong_sessions' | 'xiaogong_tool_events';
+  refId?: string;
+  count?: number;
+  summary?: string;
+};
+
+export type ConfirmationRequest = {
+  id: string;
+  title: string;
+  message: string;
+  permissionLevel: XiaogongToolEventSummary['permissionLevel'];
+  toolName: string;
+  input: unknown;
+};
+
+export type PhotoExplanation = {
+  photoId: string;
+  title: string;
+  reason: string;
+  evidence: string[];
+};
+
+export type XiaogongRunResult = {
+  sessionId: string;
+  status: 'completed' | 'needs_confirmation' | 'failed';
+  intent: XiaogongIntentType;
+  message: string;
+  summary?: string;
+  uiPatch?: XiaogongUiPatch;
+  smartView?: SmartViewSummary;
+  toolEvents: XiaogongToolEventSummary[];
+  artifacts?: BrainArtifact[];
+  stateWrites?: BrainStateWrite[];
+  confirmation?: ConfirmationRequest;
+  currentPhotoExplanation?: PhotoExplanation;
+  debugTraceId?: string;
+};
+
+export type XiaogongProgressEvent = {
+  sessionId: string;
+  status: 'running' | 'completed' | 'failed';
+  phase:
+    | 'intent'
+    | 'context'
+    | 'ranking'
+    | 'smart_view'
+    | 'ui_patch'
+    | 'completed'
+    | 'failed'
+    | BrainUiLogEvent['phase'];
+  message: string;
+  uiLog?: BrainUiLogEvent;
+};
+
+export type BrainBucket =
+  | 'featured'
+  | 'closedEyes'
+  | 'eyeReview'
+  | 'subject'
+  | 'technical'
+  | 'duplicates'
+  | 'similarBursts'
+  | 'pending';
+
+export type BrainVisualScores = {
+  visualQuality: number;
+  expression: number;
+  moment: number;
+  composition: number;
+  backgroundCleanliness: number;
+  storyValue: number;
+};
+
+export type BrainPhotoReview = {
+  photoId: string;
+  runId: string;
+  primaryBucket: BrainBucket;
+  secondaryBuckets: BrainBucket[];
+  confidence: number;
+  recommendedAction: Decision | 'review';
+  reason: string;
+  smallModelOverrides: string[];
+  needsHumanReview: boolean;
+  visualScores: BrainVisualScores;
+  representativeRank?: number;
+  groupReason?: string;
+  groupId?: string;
+  groupRank?: number;
+  groupRole?: 'representative' | 'backup' | 'rejected' | 'single';
+  model: string;
+  createdAt: string;
+};
+
+export type BrainReviewStrategy = {
+  strategySummary: string;
+  priorityPhotoIds: string[];
+  riskPhotoIds: string[];
+  groupIdsToCompare: string[];
+  skipPhotoIds: string[];
+};
+
+export type BrainPhotoReviewDraft = {
+  photoId: string;
+  primaryBucket: BrainBucket;
+  secondaryBuckets: BrainBucket[];
+  confidence: number;
+  recommendedAction: Decision | 'review';
+  reason: string;
+  smallModelOverrides: string[];
+  needsHumanReview: boolean;
+  visualScores: BrainVisualScores;
+};
+
+export type BrainGroupReviewDraft = {
+  groupId: string;
+  representativePhotoId: string;
+  rankedPhotoIds: string[];
+  groupReason: string;
+  roles: Array<{
+    photoId: string;
+    groupRank: number;
+    groupRole: 'representative' | 'backup' | 'rejected' | 'single';
+  }>;
+};
+
+export type WriteBrainReviewResultInput = {
+  batchId: string;
+  strategySummary: string;
+  reviews: BrainPhotoReviewDraft[];
+  groupReviews: BrainGroupReviewDraft[];
+};
+
+export type BrainRunStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+
+export type BrainRunScope = 'photo' | 'bucket' | 'group' | 'batch';
+
+export type BrainRunSummary = {
+  runId: string;
+  status: BrainRunStatus;
+  scope: BrainRunScope;
+  summary?: string;
+  strategy?: string;
+  bucketCounts?: Partial<Record<BrainBucket, number>>;
+  reviewed: number;
+  model: string;
+  debugLogPath?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type BrainRunRequest = {
+  batchId: string;
+  scope: BrainRunScope;
+  focusMode?: string;
+  activePhotoId?: string;
+};
+
+export type BrainRunResult = {
+  runId: string;
+  status: BrainRunStatus;
+  batchId: string;
+  scope: BrainRunScope;
+  reviewed: number;
+  message: string;
+  summary?: string;
+  strategy?: string;
+  bucketCounts?: Partial<Record<BrainBucket, number>>;
+  debugLogPath?: string;
+  reviews: BrainPhotoReview[];
+};
+
+export type BrainProgressEvent = {
+  runId: string;
+  status: BrainRunStatus;
+  phase: 'started' | 'context' | 'planning' | 'photo_started' | 'photo_completed' | 'group_started' | 'group_completed' | 'reducing' | 'persisting' | 'completed' | 'failed';
+  batchId: string;
+  scope: BrainRunScope;
+  message: string;
+  current: number;
+  total: number;
+  photoId?: string;
+  fileName?: string;
+  debugLogPath?: string;
 };

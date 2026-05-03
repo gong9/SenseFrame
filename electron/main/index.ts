@@ -4,6 +4,10 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from
 import { is } from '@electron-toolkit/utils';
 import { loadLocalEnv } from './env';
 import { analyzeSemantic, semanticSearch } from './openaiService';
+import { recordBrainFeedback } from './brainService';
+import { startBrainReviewThroughRuntime } from './brainReviewOrchestrator';
+import { runXiaogongTask } from './xiaogongOrchestrator';
+import { getSmartView, listSmartViews } from './xiaogongSmartViewService';
 import { deleteBatch, getBatch, importSource, listBatches, reanalyzeBatch, rebuildClusters, saveDecision, workerHint } from './photoPipeline';
 
 function createWindow(): void {
@@ -83,6 +87,15 @@ app.whenReady().then(() => {
   });
   ipcMain.handle('ai:analyzeSemantic', async (_event, payload: { batchId: string; photoId: string }) => analyzeSemantic(payload.batchId, payload.photoId));
   ipcMain.handle('ai:search', async (_event, payload: { batchId: string; query: string }) => semanticSearch(payload.batchId, payload.query));
+  ipcMain.handle('brain:startReview', async (event, payload) => startBrainReviewThroughRuntime(payload, (progress) => {
+    event.sender.send('brain:progress', progress);
+  }));
+  ipcMain.handle('brain:feedback', async (_event, payload) => recordBrainFeedback(payload));
+  ipcMain.handle('xiaogong:run', async (event, payload) => runXiaogongTask(payload, (progress) => {
+    event.sender.send('xiaogong:progress', progress);
+  }));
+  ipcMain.handle('xiaogong:getSmartView', async (_event, viewId: string) => getSmartView(viewId));
+  ipcMain.handle('xiaogong:listSmartViews', async (_event, batchId: string) => listSmartViews(batchId));
   ipcMain.handle('system:workerHint', async () => workerHint());
   ipcMain.handle('export:csv', async (_event, batchId: string) => {
     const batch = getBatch(batchId);

@@ -545,8 +545,17 @@ export function getBatch(batchId: string): BatchView {
   `).all(batchId) as any[];
   const analyses = db.prepare('SELECT * FROM photo_analysis WHERE photo_id IN (SELECT id FROM photos WHERE batch_id = ?)').all(batchId) as any[];
   const semantics = db.prepare('SELECT * FROM semantic_analysis WHERE photo_id IN (SELECT id FROM photos WHERE batch_id = ?)').all(batchId) as any[];
+  const brainReviews = db.prepare('SELECT * FROM brain_bucket_assignments WHERE photo_id IN (SELECT id FROM photos WHERE batch_id = ?)').all(batchId) as any[];
+  const brainRun = db.prepare(`
+    SELECT id, batch_id, scope, status, model, debug_log_path, reviewed_count, summary, strategy_json, bucket_counts_json, created_at, updated_at
+    FROM brain_runs
+    WHERE batch_id = ? AND status = 'completed'
+    ORDER BY updated_at DESC
+    LIMIT 1
+  `).get(batchId) as any;
   const analysisById = new Map(analyses.map((row) => [row.photo_id, row]));
   const semanticById = new Map(semantics.map((row) => [row.photo_id, row]));
+  const brainById = new Map(brainReviews.map((row) => [row.photo_id, row]));
   const clusters = db.prepare('SELECT id, batch_id as batchId, size, best_photo_id as bestPhotoId, confidence FROM clusters WHERE batch_id = ? ORDER BY id').all(batchId) as any[];
   const members = db.prepare('SELECT cluster_id as clusterId, photo_id as photoId, rank_in_cluster as rank, similarity_to_best as similarityToBest, recommended FROM cluster_members WHERE cluster_id LIKE ?').all(`${batchId}-%`) as any[];
   const membersByCluster = new Map<string, any[]>();
@@ -554,9 +563,25 @@ export function getBatch(batchId: string): BatchView {
 
   return {
     ...batch,
+    brainRun: brainRun
+      ? {
+          runId: brainRun.id,
+          status: brainRun.status,
+          scope: brainRun.scope,
+          summary: brainRun.summary || undefined,
+          strategy: brainRun.strategy_json ? JSON.parse(brainRun.strategy_json).summary || JSON.stringify(JSON.parse(brainRun.strategy_json)) : undefined,
+          bucketCounts: brainRun.bucket_counts_json ? JSON.parse(brainRun.bucket_counts_json) : undefined,
+          reviewed: brainRun.reviewed_count,
+          model: brainRun.model,
+          debugLogPath: brainRun.debug_log_path || undefined,
+          createdAt: brainRun.created_at,
+          updatedAt: brainRun.updated_at
+        }
+      : undefined,
     photos: photos.map((row) => {
       const analysis = analysisById.get(row.id);
       const semantic = semanticById.get(row.id);
+      const brain = brainById.get(row.id);
       return {
         id: row.id,
         batchId: row.batch_id,
@@ -614,6 +639,27 @@ export function getBatch(batchId: string): BatchView {
               llmScore: JSON.parse(semantic.llm_score),
               model: semantic.model,
               isMock: Boolean(semantic.is_mock)
+            }
+          : undefined,
+        brainReview: brain
+          ? {
+              photoId: brain.photo_id,
+              runId: brain.run_id,
+              primaryBucket: brain.primary_bucket,
+              secondaryBuckets: JSON.parse(brain.secondary_buckets || '[]'),
+              confidence: brain.confidence,
+              recommendedAction: brain.recommended_action,
+              reason: brain.reason,
+              smallModelOverrides: JSON.parse(brain.small_model_overrides || '[]'),
+              needsHumanReview: Boolean(brain.needs_human_review),
+              visualScores: JSON.parse(brain.visual_scores || '{}'),
+              representativeRank: brain.representative_rank || undefined,
+              groupReason: brain.group_reason || undefined,
+              groupId: brain.group_id || undefined,
+              groupRank: brain.group_rank || undefined,
+              groupRole: brain.group_role || undefined,
+              model: brain.model,
+              createdAt: brain.created_at
             }
           : undefined
       } satisfies PhotoView;

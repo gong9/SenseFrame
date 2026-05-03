@@ -8,22 +8,39 @@ import {
   Eye,
   FolderOpen,
   HardDrive,
+  Home,
   Image as ImageIcon,
   Layers,
   Loader2,
   ScanFace,
   Sparkles,
   Star,
+  Send,
   Trash2,
   TriangleAlert,
   X,
   ZoomIn,
   ZoomOut
 } from 'lucide-react';
-import type { BatchView, Cluster, Decision, ImportProgress, PhotoView, SearchResult } from '../electron/shared/types';
+import type {
+  BatchView,
+  BrainPhotoReview,
+  BrainProgressEvent,
+  BrainRunResult,
+  BrainUiLogEvent,
+  Cluster,
+  Decision,
+  ImportProgress,
+  PhotoView,
+  SearchResult,
+  SmartView,
+  SmartViewSummary,
+  XiaogongProgressEvent,
+  XiaogongRunResult
+} from '../electron/shared/types';
 import './styles.css';
 
-type ViewMode = 'featured' | 'closedEyes' | 'eyeReview' | 'subject' | 'technical' | 'duplicates' | 'similarBursts' | 'pending' | 'search';
+type ViewMode = 'featured' | 'closedEyes' | 'eyeReview' | 'subject' | 'technical' | 'duplicates' | 'similarBursts' | 'pending' | 'search' | 'smartView';
 
 function pct(value?: number): string {
   return `${Math.round((value || 0) * 100)}`;
@@ -159,8 +176,19 @@ function reviewScore(photo: PhotoView): number {
   if (analysis?.faceVisibility === 'visible') score += 0.03;
   if (photo.decision === 'pick') score += 0.18;
   if (photo.decision === 'reject') score -= 0.4;
+  if (photo.brainReview?.primaryBucket === 'featured') score += 0.16;
+  if (brainBlocksFeatured(photo)) score -= 0.45;
   if (photo.rating) score += Math.min(0.14, photo.rating * 0.025);
   return Math.max(0, Math.min(1, score));
+}
+
+function brainBlocksFeatured(photo: PhotoView): boolean {
+  const review = photo.brainReview;
+  if (!review) return false;
+  if (photo.decision === 'pick') return false;
+  if (review.primaryBucket !== 'featured') return true;
+  if (review.needsHumanReview) return true;
+  return review.recommendedAction === 'reject' || review.recommendedAction === 'maybe' || review.recommendedAction === 'review';
 }
 
 function canFeature(photo: PhotoView): boolean {
@@ -169,6 +197,7 @@ function canFeature(photo: PhotoView): boolean {
   if (flags.has('unsupported_preview') || flags.has('raw_decode_failed') || flags.has('heic_decode_failed')) return false;
   if (flags.has('closed_eyes') || photo.analysis?.eyeState === 'closed') return false;
   if (photo.decision === 'reject') return false;
+  if (brainBlocksFeatured(photo)) return false;
   return reviewScore(photo) >= 0.58;
 }
 
@@ -222,6 +251,17 @@ function App(): React.ReactElement {
   const [clusterIndex, setClusterIndex] = useState(0);
   const [photoIndex, setPhotoIndex] = useState(0);
   const [busy, setBusy] = useState('');
+  const [brainBusy, setBrainBusy] = useState('');
+  const [brainProgress, setBrainProgress] = useState<BrainProgressEvent | null>(null);
+  const [brainActivity, setBrainActivity] = useState<BrainProgressEvent[]>([]);
+  const [lastBrainRun, setLastBrainRun] = useState<BrainRunResult | null>(null);
+  const [xiaogongBusy, setXiaogongBusy] = useState('');
+  const [xiaogongInput, setXiaogongInput] = useState('');
+  const [xiaogongProgress, setXiaogongProgress] = useState<XiaogongProgressEvent | null>(null);
+  const [xiaogongActivity, setXiaogongActivity] = useState<BrainUiLogEvent[]>([]);
+  const [lastXiaogongResult, setLastXiaogongResult] = useState<XiaogongRunResult | null>(null);
+  const [smartViews, setSmartViews] = useState<SmartViewSummary[]>([]);
+  const [activeSmartView, setActiveSmartView] = useState<SmartView | null>(null);
   const [importProgress, setImportProgress] = useState<ImportProgress | null>(null);
   const [notice, setNotice] = useState('');
   const [query, setQuery] = useState('');
@@ -235,17 +275,47 @@ function App(): React.ReactElement {
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   const [imageSize, setImageSize] = useState({ width: 0, height: 0 });
 
+  useEffect(() => {
+    if (!notice) return;
+    const timeout = window.setTimeout(() => setNotice(''), notice.length > 100 ? 8000 : 4800);
+    return () => window.clearTimeout(timeout);
+  }, [notice]);
+
   async function refreshBatches(): Promise<void> {
     if (!window.senseframe) return;
     setBatches(await window.senseframe.listBatches());
   }
 
-  async function loadBatch(id: string): Promise<void> {
+  async function loadBatch(id: string, options?: { preserveSmartViewId?: string; preservePhotoId?: string; resetView?: boolean }): Promise<void> {
     if (!window.senseframe) return;
     const next = await window.senseframe.getBatch(id);
     setBatch(next);
+    setSmartViews(await window.senseframe.listSmartViews(id));
+    if (options?.preserveSmartViewId) {
+      const view = await window.senseframe.getSmartView(options.preserveSmartViewId);
+      setActiveSmartView(view);
+      setMode('smartView');
+      const nextIndex = options.preservePhotoId ? view.items.findIndex((item) => item.photoId === options.preservePhotoId) : -1;
+      setPhotoIndex(Math.max(0, nextIndex));
+      return;
+    }
+    if (options?.resetView !== false) setActiveSmartView(null);
+    if (options?.resetView !== false && mode === 'smartView') setMode('featured');
     setClusterIndex(0);
     setPhotoIndex(0);
+  }
+
+  function goHome(): void {
+    setBatch(null);
+    setMode('featured');
+    setActiveSmartView(null);
+    setSmartViews([]);
+    setClusterIndex(0);
+    setPhotoIndex(0);
+    setResults([]);
+    setQuery('');
+    setCanvasPhoto(undefined);
+    setNotice('');
   }
 
   async function removeBatch(id: string, name: string): Promise<void> {
@@ -299,73 +369,107 @@ function App(): React.ReactElement {
   useEffect(() => {
     refreshBatches().then(() => undefined);
     if (!window.senseframe) return;
-    return window.senseframe.onImportProgress((progress) => {
+    const offImport = window.senseframe.onImportProgress((progress) => {
       setImportProgress(progress);
       setBusy(progress.total ? `${progress.message} ${progress.current || 0}/${progress.total}` : progress.message);
     });
+    const offBrain = window.senseframe.onBrainProgress((progress) => {
+      setBrainProgress(progress);
+      setBrainActivity((items) => [progress, ...items].slice(0, 8));
+      if (progress.status === 'running') setBrainBusy(`${progress.message} ${progress.current}/${progress.total}`);
+    });
+    const offXiaogong = window.senseframe.onXiaogongProgress((progress) => {
+      setXiaogongProgress(progress);
+      if (progress.uiLog) {
+        setXiaogongActivity((items) => [...items, progress.uiLog as BrainUiLogEvent].slice(-160));
+      }
+      if (progress.status === 'running') setXiaogongBusy(progress.message);
+      if (progress.status === 'completed' || progress.status === 'failed') setXiaogongBusy('');
+    });
+    return () => {
+      offImport();
+      offBrain();
+      offXiaogong();
+    };
   }, []);
 
   const duplicateIds = useMemo(() => (batch ? duplicatePhotoIds(batch) : new Set<string>()), [batch]);
   const clusterMeta = useMemo(() => (batch ? clusterMetaByPhoto(batch) : new Map<string, ClusterMeta>()), [batch]);
   const burstMeta = useMemo(() => (batch ? similarBurstMetaByPhoto(batch) : new Map<string, BurstMeta>()), [batch]);
-  const featuredIds = useMemo(() => (batch ? featuredPhotoIds(batch, burstMeta, clusterMeta) : new Set<string>()), [batch, burstMeta, clusterMeta]);
+  const hasBrainCuration = Boolean(batch?.brainRun?.status === 'completed');
+  const featuredIds = useMemo(() => {
+    if (!batch) return new Set<string>();
+    if (hasBrainCuration) {
+      return new Set(batch.photos
+        .filter((photo) => photo.decision !== 'reject')
+        .filter((photo) => photo.brainReview?.primaryBucket === 'featured')
+        .filter((photo) => photo.brainReview?.recommendedAction === 'pick' || photo.brainReview?.recommendedAction === 'none' || photo.decision === 'pick')
+        .filter((photo) => !photo.brainReview?.needsHumanReview || photo.decision === 'pick')
+        .map((photo) => photo.id));
+    }
+    return featuredPhotoIds(batch, burstMeta, clusterMeta);
+  }, [batch, burstMeta, clusterMeta, hasBrainCuration]);
+  const brainBucketCount = (bucket: ViewMode): number => {
+    if (!batch || !hasBrainCuration || bucket === 'search') return 0;
+    return batch.photos.filter((photo) => photo.brainReview?.primaryBucket === bucket).length;
+  };
   const bucketDefs = useMemo(() => {
     if (!batch) return [];
     const buckets: Array<{ id: ViewMode; label: string; description: string; count: number; icon: React.ReactNode }> = [
       {
         id: 'featured',
         label: '精选候选',
-        description: '每段优先看的照片',
+        description: hasBrainCuration ? '大脑最终优先看的照片' : '每段优先看的照片',
         count: featuredIds.size,
         icon: <Sparkles size={16} />
       },
       {
         id: 'closedEyes',
         label: '疑似闭眼',
-        description: '双眼高置信闭合',
-        count: batch.photos.filter((photo) => hasAnyFlag(photo, closedEyeFlags)).length,
+        description: hasBrainCuration ? '大脑确认更像失败闭眼' : '双眼高置信闭合',
+        count: hasBrainCuration ? brainBucketCount('closedEyes') : batch.photos.filter((photo) => hasAnyFlag(photo, closedEyeFlags)).length,
         icon: <Eye size={16} />
       },
       {
         id: 'eyeReview',
         label: '眼部复核',
-        description: '侧脸、远景或遮挡',
-        count: batch.photos.filter((photo) => hasAnyFlag(photo, eyeReviewFlags)).length,
+        description: hasBrainCuration ? '大脑认为需要人工看眼部' : '侧脸、远景或遮挡',
+        count: hasBrainCuration ? brainBucketCount('eyeReview') : batch.photos.filter((photo) => hasAnyFlag(photo, eyeReviewFlags)).length,
         icon: <Eye size={16} />
       },
       {
         id: 'subject',
         label: '主体问题',
-        description: '裁切或主体弱',
-        count: batch.photos.filter((photo) => hasAnyFlag(photo, subjectFlags)).length,
+        description: hasBrainCuration ? '大脑确认主体/构图风险' : '裁切或主体弱',
+        count: hasBrainCuration ? brainBucketCount('subject') : batch.photos.filter((photo) => hasAnyFlag(photo, subjectFlags)).length,
         icon: <ImageIcon size={16} />
       },
       {
         id: 'technical',
         label: '技术问题',
-        description: '模糊、曝光、解析失败',
-        count: batch.photos.filter((photo) => hasAnyFlag(photo, technicalFlags) || photo.status !== 'ready').length,
+        description: hasBrainCuration ? '大脑确认技术风险' : '模糊、曝光、解析失败',
+        count: hasBrainCuration ? brainBucketCount('technical') : batch.photos.filter((photo) => hasAnyFlag(photo, technicalFlags) || photo.status !== 'ready').length,
         icon: <TriangleAlert size={16} />
       },
       {
         id: 'duplicates',
         label: '近重复',
-        description: '构图几乎一致的照片',
-        count: duplicateIds.size,
+        description: hasBrainCuration ? '大脑组内排序后的近重复' : '构图几乎一致的照片',
+        count: hasBrainCuration ? brainBucketCount('duplicates') : duplicateIds.size,
         icon: <Layers size={16} />
       },
       {
         id: 'similarBursts',
         label: '相似连拍',
         description: '同一动作段的照片',
-        count: burstMeta.size,
+        count: hasBrainCuration ? brainBucketCount('similarBursts') : burstMeta.size,
         icon: <Layers size={16} />
       },
       {
         id: 'pending',
         label: '待判断',
-        description: 'AI 不确定，建议人工看',
-        count: batch.photos.filter((photo) => {
+        description: hasBrainCuration ? '大脑明确留给人工判断' : 'AI 不确定，建议人工看',
+        count: hasBrainCuration ? brainBucketCount('pending') : batch.photos.filter((photo) => {
           const flags = photo.analysis?.riskFlags || [];
           return photo.analysis?.eyeState === 'uncertain' || photo.analysis?.faceVisibility === 'unknown' || (flags.length > 0 && !featuredIds.has(photo.id));
         }).length,
@@ -373,12 +477,19 @@ function App(): React.ReactElement {
       }
     ];
     return buckets;
-  }, [batch, duplicateIds, burstMeta, featuredIds]);
+  }, [batch, duplicateIds, burstMeta, featuredIds, hasBrainCuration]);
   const activeBucket = bucketDefs.find((bucket) => bucket.id === mode);
   const visiblePhotos = useMemo(() => {
     if (!batch) return [];
     if (mode === 'search') return results.map((item) => item.photo);
+    if (mode === 'smartView' && activeSmartView) {
+      const byId = new Map(batch.photos.map((photo) => [photo.id, photo]));
+      return activeSmartView.items
+        .map((item) => byId.get(item.photoId))
+        .filter((photo): photo is PhotoView => Boolean(photo));
+    }
     if (mode === 'featured') return batch.photos.filter((photo) => featuredIds.has(photo.id)).sort((a, b) => reviewScore(b) - reviewScore(a));
+    if (hasBrainCuration) return batch.photos.filter((photo) => photo.brainReview?.primaryBucket === mode);
     if (mode === 'closedEyes') return batch.photos.filter((photo) => hasAnyFlag(photo, closedEyeFlags));
     if (mode === 'eyeReview') return batch.photos.filter((photo) => hasAnyFlag(photo, eyeReviewFlags));
     if (mode === 'subject') return batch.photos.filter((photo) => hasAnyFlag(photo, subjectFlags));
@@ -403,8 +514,9 @@ function App(): React.ReactElement {
       return photo.analysis?.eyeState === 'uncertain' || photo.analysis?.faceVisibility === 'unknown' || (flags.length > 0 && !featuredIds.has(photo.id));
     });
     return [];
-  }, [batch, mode, results, duplicateIds, burstMeta, featuredIds]);
+  }, [batch, mode, results, activeSmartView, duplicateIds, burstMeta, featuredIds, hasBrainCuration]);
   const activePhoto = visiblePhotos[Math.min(photoIndex, Math.max(visiblePhotos.length - 1, 0))];
+  const activeSmartViewItem = activeSmartView?.items.find((item) => item.photoId === activePhoto?.id);
   const activeClusterMeta = activePhoto ? clusterMeta.get(activePhoto.id) : undefined;
   const activeBurstMeta = activePhoto ? burstMeta.get(activePhoto.id) : undefined;
   const isFitZoom = imageZoom === 1;
@@ -576,8 +688,10 @@ function App(): React.ReactElement {
   async function decide(decision: Decision, rating?: number): Promise<void> {
     if (!batch || !activePhoto) return;
     if (!window.senseframe) return;
+    const preserveSmartViewId = mode === 'smartView' ? activeSmartView?.id : undefined;
+    const preservePhotoId = activePhoto.id;
     await window.senseframe.saveDecision({ batchId: batch.id, photoId: activePhoto.id, decision, rating });
-    await loadBatch(batch.id);
+    await loadBatch(batch.id, { preserveSmartViewId, preservePhotoId, resetView: !preserveSmartViewId });
   }
 
   async function analyzeSemantic(): Promise<void> {
@@ -625,6 +739,90 @@ function App(): React.ReactElement {
     if (result) setNotice(`已导出 ${result.count} 张已选照片：${result.dir}`);
   }
 
+  async function runBrainReview(): Promise<void> {
+    if (!batch || !window.senseframe || !batch.photos.length) return;
+    setBrainBusy(`小宫正在接管整批审片 · ${batch.photos.length} 张...`);
+    setBrainProgress(null);
+    setBrainActivity([]);
+    setLastBrainRun(null);
+    try {
+      const result = await window.senseframe.startBrainReview({
+        batchId: batch.id,
+        scope: 'batch',
+        focusMode: mode,
+        activePhotoId: activePhoto?.id
+      });
+      setLastBrainRun(result);
+      await loadBatch(batch.id, { resetView: true });
+      setMode(mode === 'smartView' ? 'featured' : mode);
+      setNotice(result.status === 'completed' ? result.message : `小宫审片失败：${result.message}`);
+    } catch (error) {
+      setNotice(`小宫审片失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBrainBusy('');
+    }
+  }
+
+  async function openSmartView(viewId: string): Promise<void> {
+    if (!window.senseframe) return;
+    const view = await window.senseframe.getSmartView(viewId);
+    setActiveSmartView(view);
+    setMode('smartView');
+    setPhotoIndex(0);
+  }
+
+  async function runXiaogong(message: string = xiaogongInput): Promise<void> {
+    if (!batch || !window.senseframe || !message.trim()) return;
+    setXiaogongBusy('正在交给小宫...');
+    setXiaogongProgress(null);
+    setXiaogongActivity([]);
+    setLastXiaogongResult(null);
+    try {
+      const result = await window.senseframe.runXiaogong({
+        batchId: batch.id,
+        message: message.trim(),
+        currentMode: mode,
+        activePhotoId: activePhoto?.id,
+        smartViewId: activeSmartView?.id
+      });
+      setLastXiaogongResult(result);
+      setXiaogongProgress(null);
+      if (result.smartView) {
+        setSmartViews(await window.senseframe.listSmartViews(batch.id));
+      }
+      if (result.uiPatch?.smartViewId) {
+        await openSmartView(result.uiPatch.smartViewId);
+      }
+      setNotice(result.uiPatch?.notice || result.message);
+      setXiaogongInput('');
+    } catch (error) {
+      setNotice(`小宫任务失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setXiaogongBusy('');
+    }
+  }
+
+  async function applyBrainSuggestion(review: BrainPhotoReview): Promise<void> {
+    if (!batch || !activePhoto || !window.senseframe) return;
+    if (review.recommendedAction === 'pick' || review.recommendedAction === 'reject' || review.recommendedAction === 'maybe') {
+      const preserveSmartViewId = mode === 'smartView' ? activeSmartView?.id : undefined;
+      const preservePhotoId = activePhoto.id;
+      await window.senseframe.recordBrainFeedback({ photoId: activePhoto.id, runId: review.runId, action: 'accepted', note: review.recommendedAction });
+      await window.senseframe.saveDecision({ batchId: batch.id, photoId: activePhoto.id, decision: review.recommendedAction });
+      await loadBatch(batch.id, { preserveSmartViewId, preservePhotoId, resetView: !preserveSmartViewId });
+      setNotice('已按大脑建议更新标记。');
+      return;
+    }
+    await window.senseframe.recordBrainFeedback({ photoId: activePhoto.id, runId: review.runId, action: 'reviewed', note: 'no direct decision' });
+    setNotice('已记录大脑建议为人工复核。');
+  }
+
+  async function rejectBrainSuggestion(review: BrainPhotoReview, note?: string): Promise<void> {
+    if (!activePhoto || !window.senseframe) return;
+    await window.senseframe.recordBrainFeedback({ photoId: activePhoto.id, runId: review.runId, action: 'rejected', note: note?.trim() || undefined });
+    setNotice(note?.trim() ? '已记录不采纳和理由。' : '已记录不采纳这条大脑评价。');
+  }
+
   useEffect(() => {
     function onKey(event: KeyboardEvent): void {
       if (event.target instanceof HTMLInputElement) return;
@@ -648,8 +846,8 @@ function App(): React.ReactElement {
   }, [visiblePhotos.length, batch, activePhoto]);
 
   return (
-    <main className="app-shell">
-      <aside className="sidebar">
+    <main className={`app-shell ${batch ? 'app-shell-ready' : 'app-shell-empty'}`}>
+      {batch && <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark"><Aperture size={22} /></div>
           <div>
@@ -719,26 +917,64 @@ function App(): React.ReactElement {
             ))}
           </div>
         )}
-      </aside>
+
+        {batch && smartViews.length > 0 && (
+          <div className="xiaogong-views">
+            <div className="section-label">小宫视图</div>
+            {smartViews.map((view) => (
+              <button
+                key={view.id}
+                className={`bucket-item smart-view-item ${activeSmartView?.id === view.id && mode === 'smartView' ? 'active' : ''}`}
+                onClick={() => openSmartView(view.id)}
+              >
+                <span className="bucket-icon"><Brain size={15} /></span>
+                <span className="bucket-text">
+                  <strong>{view.name}</strong>
+                  <small>{view.summary}</small>
+                </span>
+                <em>{view.photoCount}</em>
+              </button>
+            ))}
+          </div>
+        )}
+      </aside>}
 
       <section className={`workspace ${batch ? 'workspace-ready' : 'workspace-empty'}`}>
         <header className="topbar">
-          <div>
-            <h1>{batch ? `${activeBucket?.label || '语义搜索'} · ${visiblePhotos.length}` : '选择一个拍摄批次开始'}</h1>
-            <p>{batch ? `${batch.name} · ${batch.clusters.length} 个相似组 · ${stats.rejected} 张淘汰建议已确认` : '导入后会自动生成缩略图、RAW 预览、质量分、人脸闭眼检测和相似组。'}</p>
+          <div className="topbar-title">
+            {batch && (
+              <button className="home-command" onClick={goHome} title="返回首页" aria-label="返回首页">
+                <Home size={15} />
+                <span>首页</span>
+              </button>
+            )}
+            <div>
+              <h1>{batch ? `${mode === 'smartView' ? activeSmartView?.name || '小宫视图' : activeBucket?.label || '语义搜索'} · ${visiblePhotos.length}` : '选择一个拍摄批次开始'}</h1>
+              <p>{batch ? (mode === 'smartView' && activeSmartView ? activeSmartView.summary : `${batch.name} · ${batch.clusters.length} 个相似组 · ${stats.rejected} 张淘汰建议已确认`) : '导入后会自动生成缩略图、RAW 预览、质量分、人脸闭眼检测和相似组。'}</p>
+            </div>
           </div>
           {batch && (
             <div className="toolbar">
-              <button className={debugMode ? 'selected' : ''} onClick={() => setDebugMode((value) => !value)}>
-                <ScanFace size={16} /> 调试框
+              <button className="brain-action" onClick={runBrainReview} disabled={Boolean(brainBusy || busy)} title="小宫审片">
+                {brainBusy ? <Loader2 className="spin" size={16} /> : <Brain size={16} />} 小宫
               </button>
-              <button onClick={exportSelected}><Download size={16} /> 导出已选</button>
+              <button className={debugMode ? 'selected' : ''} onClick={() => setDebugMode((value) => !value)} title="调试框">
+                <ScanFace size={16} /> 调试
+              </button>
+              <button onClick={exportSelected} title="导出已选"><Download size={16} /> 导出</button>
             </div>
           )}
         </header>
 
         {!batch ? (
-          <EmptyState onImportFolder={() => importSource('folder')} onImportArchive={() => importSource('archive')} disabled={Boolean(importProgress)} />
+          <EmptyState
+            batches={batches}
+            onImportFolder={() => importSource('folder')}
+            onImportArchive={() => importSource('archive')}
+            onOpenBatch={loadBatch}
+            onRemoveBatch={removeBatch}
+            disabled={Boolean(importProgress)}
+          />
         ) : (
           <div className="main-grid">
             <section className="viewer">
@@ -752,7 +988,7 @@ function App(): React.ReactElement {
                 >
                 {canvasPhoto && (
                   <div className="canvas-hud">
-                    <span>{activeBucket?.label || '审片'}</span>
+                    <span>{mode === 'smartView' ? activeSmartView?.name || '小宫视图' : activeBucket?.label || '审片'}</span>
                     <strong>{canvasPhoto.fileName}</strong>
                     <em>{visiblePhotos.length ? `${canvasPhotoIndex >= 0 ? canvasPhotoIndex + 1 : Math.min(photoIndex + 1, visiblePhotos.length)} / ${visiblePhotos.length}` : '0 / 0'}</em>
                   </div>
@@ -781,7 +1017,7 @@ function App(): React.ReactElement {
                 ) : (
                   <div className="missing-preview"><ImageIcon size={46} />预览不可用</div>
                 )}
-                {busy && <div className="busy"><Loader2 className="spin" size={18} /> {busy}</div>}
+                {(busy || brainBusy) && <div className="busy"><Loader2 className="spin" size={18} /> {brainBusy || busy}</div>}
                 {activePhoto?.previewPath && (
                   <div className="zoom-controls" aria-label="图片缩放" onPointerDown={(event) => event.stopPropagation()}>
                     <button title="缩小" onClick={() => setZoom(imageZoom - 0.25)}>
@@ -819,6 +1055,7 @@ function App(): React.ReactElement {
                       {meta && <span className="rank-badge">{meta.rank}/{meta.clusterSize}</span>}
                       {!meta && burst && <span className="rank-badge">{burst.rank}/{burst.burstSize}</span>}
                       {featured && <span className="badge">精选</span>}
+                      {mode === 'smartView' && activeSmartView && <span className="smart-rank">#{index + 1}</span>}
                     </button>
                   );
                 })}
@@ -838,12 +1075,41 @@ function App(): React.ReactElement {
                   <span>{activeBurstMeta.label} · 第 {activeBurstMeta.rank}/{activeBurstMeta.burstSize}</span>
                 </div>
               )}
-              <PhotoPanel photo={activePhoto} onDecide={decide} />
+              <BrainActivityPanel
+                progress={brainProgress}
+                activity={brainActivity}
+                active={Boolean(brainBusy)}
+                lastRun={lastBrainRun}
+              />
+              <PhotoPanel
+                photo={activePhoto}
+                onDecide={decide}
+                onApplyBrainSuggestion={applyBrainSuggestion}
+                onRejectBrainSuggestion={rejectBrainSuggestion}
+              />
+              <XiaogongConsole
+                busy={xiaogongBusy}
+                input={xiaogongInput}
+                progress={xiaogongProgress}
+                activity={xiaogongActivity}
+                result={lastXiaogongResult}
+                activeSmartView={activeSmartView}
+                activeItem={activeSmartViewItem}
+                onInput={setXiaogongInput}
+                onRun={runXiaogong}
+              />
             </aside>
           </div>
         )}
 
-        {notice && <div className="notice" onClick={() => setNotice('')}>{notice}</div>}
+        {notice && (
+          <div className="notice" role="status">
+            <span>{notice}</span>
+            <button type="button" aria-label="关闭提示" onClick={() => setNotice('')}>
+              <X size={14} />
+            </button>
+          </div>
+        )}
         {importProgress && <ImportOverlay progress={importProgress} />}
       </section>
     </main>
@@ -914,18 +1180,59 @@ function Metric({ label, value }: { label: string; value: number }): React.React
   );
 }
 
-function EmptyState({ onImportFolder, onImportArchive, disabled }: { onImportFolder: () => void; onImportArchive: () => void; disabled: boolean }): React.ReactElement {
+function EmptyState({
+  batches,
+  onImportFolder,
+  onImportArchive,
+  onOpenBatch,
+  onRemoveBatch,
+  disabled
+}: {
+  batches: Array<{ id: string; name: string; status: string; totalPhotos: number; createdAt: string }>;
+  onImportFolder: () => void;
+  onImportArchive: () => void;
+  onOpenBatch: (batchId: string) => void | Promise<void>;
+  onRemoveBatch: (batchId: string, name: string) => void | Promise<void>;
+  disabled: boolean;
+}): React.ReactElement {
   return (
     <div className="empty studio-empty">
       <section className="studio-hero">
         <div className="hero-copy">
-          <span className="frame-kicker">AI CONTACT SHEET</span>
-          <h2>把一整组照片摊在光桌上</h2>
-          <p>先看画面，再看风险。SenseFrame 会把近重复、眼部状态、主体问题和技术缺陷整理成摄影师能快速判断的工作台。</p>
+          <span className="frame-kicker">光影入席，取舍有据</span>
+          <h2>拣尽寒枝，留住一瞬光</h2>
+          <p>把整组照片铺上光桌，先看画面，再辨风险。SenseFrame 会将近重复、眼部状态、主体问题与技术缺陷整理成清醒的审片线索。</p>
           <div className="hero-actions">
             <button className="import-button" onClick={onImportFolder} disabled={disabled}><FolderOpen size={18} /> 导入文件夹</button>
             <button className="archive-button" onClick={onImportArchive} disabled={disabled}>RAR</button>
           </div>
+          {batches.length > 0 && (
+            <div className="home-batches">
+              <div className="home-batches-head">
+                <span>最近批次</span>
+                <em>{batches.length}</em>
+              </div>
+              <div className="home-batch-list">
+                {batches.slice(0, 4).map((item, index) => (
+                  <div key={item.id} className="home-batch-item">
+                    <button onClick={() => onOpenBatch(item.id)}>
+                      <strong>批次 {String(index + 1).padStart(2, '0')}</strong>
+                      <span>{item.name}</span>
+                    </button>
+                    <em>{item.totalPhotos}</em>
+                    <button
+                      className="home-batch-delete"
+                      title="删除批次"
+                      aria-label={`删除批次 ${item.name}`}
+                      onClick={() => onRemoveBatch(item.id, item.name)}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
         <div className="light-table" aria-hidden="true">
           <div className="contact-frame main-frame">
@@ -988,7 +1295,17 @@ function ImportOverlay({ progress }: { progress: ImportProgress }): React.ReactE
   );
 }
 
-function PhotoPanel({ photo, onDecide }: { photo?: PhotoView; onDecide: (decision: Decision, rating?: number) => void }): React.ReactElement {
+function PhotoPanel({
+  photo,
+  onDecide,
+  onApplyBrainSuggestion,
+  onRejectBrainSuggestion
+}: {
+  photo?: PhotoView;
+  onDecide: (decision: Decision, rating?: number) => void;
+  onApplyBrainSuggestion: (review: BrainPhotoReview) => void;
+  onRejectBrainSuggestion: (review: BrainPhotoReview) => void;
+}): React.ReactElement {
   if (!photo) return <div className="panel empty-panel">没有可显示的照片</div>;
   const eyeStateLabel = eyeStateText(photo.analysis?.eyeState);
   return (
@@ -1001,30 +1318,426 @@ function PhotoPanel({ photo, onDecide }: { photo?: PhotoView; onDecide: (decisio
         <span className={`decision ${photo.decision}`}>{decisionLabel(photo.decision)}</span>
       </div>
 
+      <div className="decision-dock">
+        <div className="actions">
+          <button className={photo.decision === 'pick' ? 'selected pick-action' : 'pick-action'} onClick={() => onDecide('pick')} title="保留"><Check size={16} /><span>保留</span></button>
+          <button className={photo.decision === 'maybe' ? 'selected maybe-action' : 'maybe-action'} onClick={() => onDecide('maybe')} title="待定"><Eye size={16} /><span>待定</span></button>
+          <button className={photo.decision === 'reject' ? 'selected reject-action' : 'reject-action'} onClick={() => onDecide('reject')} title="淘汰"><X size={16} /><span>淘汰</span></button>
+        </div>
+
+        <div className="rating-row" aria-label="星级">
+          {[1, 2, 3, 4, 5].map((star) => (
+            <button key={star} onClick={() => onDecide('pick', star)} className={photo.rating && photo.rating >= star ? 'lit' : ''}><Star size={16} /></button>
+          ))}
+        </div>
+      </div>
+
       <div className="score-grid">
         <Score label="清晰" value={photo.analysis?.sharpnessScore} />
         <Score label="曝光" value={photo.analysis?.exposureScore} />
         <Score label="人脸" value={photo.analysis?.faceScore} />
-        <Score label="眼部状态" value={photo.analysis?.eyeConfidence} display={eyeStateLabel} />
+        <Score label="眼部" value={photo.analysis?.eyeConfidence} display={eyeStateLabel} />
       </div>
-      <p className="score-help">分数越高，表示这一项越稳定；它只做初筛参考，不会自动删除照片。</p>
 
       <div className="risk-row">
-        {(photo.analysis?.riskFlags || []).length ? photo.analysis?.riskFlags.map((flag) => <span key={flag}>{riskLabel(flag)}</span>) : <span>未发现明显技术风险</span>}
+        {(photo.analysis?.riskFlags || []).length ? photo.analysis?.riskFlags.map((flag) => <span key={flag}>{riskLabel(flag)}</span>) : <span>无明显技术风险</span>}
       </div>
 
-      <div className="actions">
-        <button className={photo.decision === 'pick' ? 'selected pick-action' : 'pick-action'} onClick={() => onDecide('pick')} title="保留"><Check size={16} /><span>保留</span></button>
-        <button className={photo.decision === 'maybe' ? 'selected maybe-action' : 'maybe-action'} onClick={() => onDecide('maybe')} title="待定"><Eye size={16} /><span>待定</span></button>
-        <button className={photo.decision === 'reject' ? 'selected reject-action' : 'reject-action'} onClick={() => onDecide('reject')} title="淘汰"><X size={16} /><span>淘汰</span></button>
+      <BrainReviewPanel
+        review={photo.brainReview}
+        photoDecision={photo.decision}
+        onApply={onApplyBrainSuggestion}
+        onReject={onRejectBrainSuggestion}
+      />
+    </div>
+  );
+}
+
+function XiaogongConsole({
+  busy,
+  input,
+  progress,
+  activity,
+  result,
+  activeSmartView,
+  activeItem,
+  onInput,
+  onRun
+}: {
+  busy: string;
+  input: string;
+  progress: XiaogongProgressEvent | null;
+  activity: BrainUiLogEvent[];
+  result: XiaogongRunResult | null;
+  activeSmartView: SmartView | null;
+  activeItem?: SmartView['items'][number];
+  onInput: (value: string) => void;
+  onRun: (message?: string) => void;
+}): React.ReactElement {
+  const quickTasks = ['找最好看的', '找封面候选', '复核闭眼', '每组选 1 张'];
+  return (
+    <section className="xiaogong-console">
+      <div className="xiaogong-head">
+        <span><Brain size={15} /> 小宫</span>
+        <em>{busy ? '运行中' : activeSmartView ? '视图控制' : '待命'}</em>
       </div>
 
-      <div className="rating-row">
-        {[1, 2, 3, 4, 5].map((star) => (
-          <button key={star} onClick={() => onDecide('pick', star)} className={photo.rating && photo.rating >= star ? 'lit' : ''}><Star size={16} /></button>
+      <div className="xiaogong-input-row">
+        <input
+          value={input}
+          placeholder="对小宫说：找出最好看的"
+          onChange={(event) => onInput(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.shiftKey) {
+              event.preventDefault();
+              onRun();
+            }
+          }}
+          disabled={Boolean(busy)}
+        />
+        <button onClick={() => onRun()} disabled={Boolean(busy || !input.trim())} title="发送">
+          {busy ? <Loader2 className="spin" size={14} /> : <Send size={14} />}
+        </button>
+      </div>
+
+      <div className="xiaogong-chips">
+        {quickTasks.map((task) => (
+          <button key={task} onClick={() => onRun(task)} disabled={Boolean(busy)}>{task}</button>
         ))}
       </div>
+
+      {busy && (
+        <div className="xiaogong-status">
+          <Loader2 className="spin" size={14} />
+          <span>{progress?.message || busy}</span>
+        </div>
+      )}
+
+      <XiaogongLogTimeline activity={activity} active={Boolean(busy)} />
+
+      {result?.confirmation && (
+        <div className="xiaogong-confirmation">
+          <strong>{result.confirmation.title}</strong>
+          <p>{result.confirmation.message}</p>
+          <span>{result.confirmation.permissionLevel}</span>
+          <div>
+            <button type="button" disabled>等待确认功能接入</button>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function XiaogongLogTimeline({ activity, active }: { activity: BrainUiLogEvent[]; active: boolean }): React.ReactElement | null {
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const [followTail, setFollowTail] = useState(true);
+  const hasActivity = activity.length > 0;
+
+  useEffect(() => {
+    const node = scrollerRef.current;
+    if (!node || !followTail) return;
+    node.scrollTop = node.scrollHeight;
+  }, [activity, followTail]);
+
+  if (!hasActivity && !active) return null;
+
+  return (
+    <div className="xiaogong-log">
+      <div className="xiaogong-log-head">
+        <span>任务日志</span>
+        <em>{active ? '运行中' : hasActivity ? '已记录' : '等待事件'}</em>
+      </div>
+      <div
+        className="xiaogong-log-list"
+        ref={scrollerRef}
+        onScroll={(event) => {
+          const node = event.currentTarget;
+          const nearBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 20;
+          setFollowTail(nearBottom);
+        }}
+      >
+        {activity.map((item) => (
+          <button
+            key={item.id}
+            className={`xiaogong-log-item ${item.level}`}
+            type="button"
+            title={item.photoFileName || xiaogongDisplayTitle(item)}
+          >
+            <span>{xiaogongPhaseLabel(item.phase)}</span>
+            <div>
+              <strong>{xiaogongDisplayTitle(item)}</strong>
+              {item.message && <p>{item.message}</p>}
+              {item.progress && item.progress.total > 0 && <em>{item.progress.current}/{item.progress.total}</em>}
+            </div>
+          </button>
+        ))}
+      </div>
+      {!followTail && (
+        <button
+          className="xiaogong-log-new"
+          type="button"
+          onClick={() => {
+            setFollowTail(true);
+            requestAnimationFrame(() => {
+              const node = scrollerRef.current;
+              if (node) node.scrollTop = node.scrollHeight;
+            });
+          }}
+        >
+          有新进展
+        </button>
+      )}
     </div>
+  );
+}
+
+function xiaogongToolTitle(toolName?: string): string | undefined {
+  if (!toolName) return undefined;
+  const titles: Record<string, string> = {
+    GetWorkspaceContext: '读取工作台状态',
+    GetBatchOverview: '理解整批照片',
+    DecideReviewStrategy: '制定审片策略',
+    GetCurrentPhoto: '读取当前照片',
+    GenerateLocalCandidates: '整理候选线索',
+    CreateSmartView: '生成智能视图',
+    ShowSmartView: '打开智能视图',
+    ReviewPhotoWithVision: '查看照片画面',
+    CompareSimilarGroupWithVision: '比较连拍组',
+    WriteBrainReviewResult: '写入小宫审片结果',
+    ExplainCurrentPhoto: '解释当前照片',
+    ApplyDecision: '准备修改照片选择',
+    BatchApplyDecisions: '准备批量修改选择',
+    SetRating: '准备修改星级',
+    ExportSelected: '准备导出已选照片',
+    DeleteBatch: '准备删除批次',
+    DeleteOriginalFiles: '准备删除原片'
+  };
+  return titles[toolName];
+}
+
+function xiaogongDisplayTitle(item: BrainUiLogEvent): string {
+  const toolTitle = xiaogongToolTitle(item.toolName);
+  if (!toolTitle) return item.title;
+  if (item.title.startsWith('工具失败')) return `${toolTitle}失败`;
+  if (item.title.startsWith('需要确认')) return `需要确认：${toolTitle}`;
+  if (item.title.startsWith('调用工具')) return toolTitle;
+  return item.title.includes(item.toolName || '') ? item.title.replace(item.toolName || '', toolTitle).replace('调用工具：', '') : item.title;
+}
+
+function xiaogongPhaseLabel(phase: BrainUiLogEvent['phase']): string {
+  const labels: Record<BrainUiLogEvent['phase'], string> = {
+    understanding: '理解',
+    workspace: '读取',
+    planning: '规划',
+    tool: '工具',
+    vision: '看图',
+    compare: '比较',
+    write: '写入',
+    ui: '界面',
+    confirmation: '确认',
+    done: '完成',
+    failed: '错误'
+  };
+  return labels[phase];
+}
+
+function BrainActivityPanel({
+  progress,
+  activity,
+  active,
+  lastRun
+}: {
+  progress: BrainProgressEvent | null;
+  activity: BrainProgressEvent[];
+  active: boolean;
+  lastRun: BrainRunResult | null;
+}): React.ReactElement | null {
+  if (!active && !progress && !lastRun) return null;
+  const status = progress?.status || lastRun?.status || 'running';
+  const total = !active && lastRun ? lastRun.reviewed : progress?.total || lastRun?.reviewed || 0;
+  const current = !active && lastRun ? lastRun.reviewed : progress?.current ?? lastRun?.reviewed ?? 0;
+  const pctValue = total ? Math.min(100, Math.round((current / total) * 100)) : 0;
+  const recentActivity = (activity.length ? activity : progress ? [progress] : []).slice(0, 3);
+  const statusLabel = active ? '审片中' : status === 'completed' ? '上次审片' : status === 'failed' ? '审片失败' : '审片状态';
+
+  return (
+    <section className={`brain-activity-panel ${status}`}>
+      <div className="brain-activity-head">
+        <span>{active ? <Loader2 className="spin" size={15} /> : <Brain size={15} />} {statusLabel}</span>
+        <em>{total ? `${current}/${total}` : status === 'completed' ? '完成' : '准备中'}</em>
+      </div>
+      <div className="brain-activity-track">
+        <i style={{ width: `${pctValue}%` }} />
+      </div>
+      <strong>{progress?.message || lastRun?.message || '小宫会把当前分组的单张判断写入右侧。'}</strong>
+      {active && recentActivity.length > 0 && (
+        <div className="brain-activity-list">
+          {recentActivity.map((item, index) => (
+            <div key={`${item.phase}-${item.photoId || item.runId}-${index}`}>
+              <span>{activityLabel(item.phase)}</span>
+              <p>{item.message}</p>
+            </div>
+          ))}
+        </div>
+      )}
+      {status === 'failed' && (progress?.debugLogPath || lastRun?.debugLogPath) && (
+        <small>日志：{progress?.debugLogPath || lastRun?.debugLogPath}</small>
+      )}
+    </section>
+  );
+}
+
+function activityLabel(phase: BrainProgressEvent['phase']): string {
+  const labels: Record<BrainProgressEvent['phase'], string> = {
+    started: '开始',
+    context: '读取',
+    planning: '规划',
+    photo_started: '看图',
+    photo_completed: '完成',
+    group_started: '比较',
+    group_completed: '组内',
+    reducing: '归并',
+    persisting: '写入',
+    completed: '结束',
+    failed: '错误'
+  };
+  return labels[phase];
+}
+
+function bucketText(bucket?: string): string {
+  const labels: Record<string, string> = {
+    featured: '精选候选',
+    closedEyes: '疑似闭眼',
+    eyeReview: '眼部复核',
+    subject: '主体问题',
+    technical: '技术问题',
+    duplicates: '近重复',
+    similarBursts: '相似连拍',
+    pending: '待判断'
+  };
+  return labels[bucket || ''] || '未分组';
+}
+
+function actionText(action?: string): string {
+  const labels: Record<string, string> = {
+    pick: '建议保留',
+    reject: '建议淘汰',
+    maybe: '建议待定',
+    review: '建议人工复核',
+    none: '不改人工标记'
+  };
+  return labels[action || ''] || '建议人工复核';
+}
+
+function scorePct(value?: number): string {
+  return `${Math.round((value || 0) * 100)}`;
+}
+
+function BrainReviewPanel({
+  review,
+  photoDecision,
+  onApply,
+  onReject
+}: {
+  review?: BrainPhotoReview;
+  photoDecision: Decision;
+  onApply: (review: BrainPhotoReview) => void;
+  onReject: (review: BrainPhotoReview, note?: string) => void;
+}): React.ReactElement {
+  const [rejecting, setRejecting] = React.useState(false);
+  const [rejectNote, setRejectNote] = React.useState('');
+
+  if (!review) {
+    return (
+      <section className="brain-review-panel empty-brain-review">
+        <div className="brain-review-head">
+          <span><Brain size={15} /> 小宫判断</span>
+          <em>尚未审片</em>
+        </div>
+        <p>运行“小宫审片”后，这里只保留当前照片的结论和关键证据。</p>
+      </section>
+    );
+  }
+
+  const scores = [
+    ['画面', review.visualScores.visualQuality],
+    ['表情', review.visualScores.expression],
+    ['瞬间', review.visualScores.moment],
+    ['构图', review.visualScores.composition],
+    ['背景', review.visualScores.backgroundCleanliness],
+    ['故事', review.visualScores.storyValue]
+  ] as const;
+  const recommendedDecision: Decision | undefined =
+    review.recommendedAction === 'pick' || review.recommendedAction === 'reject' || review.recommendedAction === 'maybe'
+      ? review.recommendedAction
+      : undefined;
+  const accepted = Boolean(recommendedDecision && photoDecision === recommendedDecision);
+  const decisionText = recommendedDecision ? decisionLabel(recommendedDecision) : '';
+
+  return (
+    <section className="brain-review-panel">
+      <div className="brain-review-head">
+        <span><Brain size={15} /> 小宫判断</span>
+        <em>{scorePct(review.confidence)}%</em>
+      </div>
+      <div className="brain-bucket-line">
+        <strong>{bucketText(review.primaryBucket)}</strong>
+        <span className={`brain-action-chip ${accepted ? 'accepted' : review.recommendedAction || 'review'}`}>
+          {accepted ? `已采纳：${decisionText}` : actionText(review.recommendedAction)}
+        </span>
+      </div>
+      <p className="brain-reason" title={review.reason}>{review.reason}</p>
+      {review.smallModelOverrides.length > 0 && (
+        <div className="brain-overrides">
+          <strong>推翻小模型</strong>
+          {review.smallModelOverrides.map((item) => <span key={item} title={item}>{item}</span>)}
+        </div>
+      )}
+      {review.needsHumanReview && <div className="brain-review-alert">需要人工复核</div>}
+      <div className="brain-score-grid">
+        {scores.map(([label, value]) => (
+          <div key={label}>
+            <span>{label}</span>
+            <strong>{scorePct(value)}</strong>
+          </div>
+        ))}
+      </div>
+      {review.groupReason && <p className="brain-group-reason" title={review.groupReason}>{review.groupReason}</p>}
+      <div className="brain-review-actions">
+        {accepted ? (
+          <div className="brain-review-accepted"><Check size={14} /> 已按小宫判断更新当前照片状态</div>
+        ) : (
+          rejecting ? (
+            <div className="brain-reject-box">
+              <textarea
+                value={rejectNote}
+                onChange={(event) => setRejectNote(event.target.value)}
+                placeholder="填写不采纳理由，例如：人物表情更自然、构图更完整、闭眼其实是情绪瞬间"
+                rows={3}
+              />
+              <div className="brain-reject-actions">
+                <button onClick={() => { onReject(review, rejectNote); setRejecting(false); setRejectNote(''); }}>
+                  <X size={14} /> 确认不采纳
+                </button>
+                <button onClick={() => { setRejecting(false); setRejectNote(''); }}>
+                  取消
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <button onClick={() => onApply(review)} disabled={review.recommendedAction === 'none'}>
+                <Check size={14} /> 采纳
+              </button>
+              <button onClick={() => setRejecting(true)}>
+                <X size={14} /> 不采纳
+              </button>
+            </>
+          )
+        )}
+      </div>
+    </section>
   );
 }
 
