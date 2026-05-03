@@ -1,81 +1,68 @@
 # SenseFrame
 
+English | [简体中文](README.zh-CN.md)
+
 ![SenseFrame desktop review workspace](docs/assets/senseframe-main-2026-05-02.png)
 
-SenseFrame is an offline-first desktop photo culling app for photographers. It imports local folders or RAR archives, builds previews, analyzes technical quality, detects face and eye state, groups near duplicates and similar bursts, then lets the reviewer keep, reject, star, search, and export decisions.
+SenseFrame is a local-first AI culling workstation for photographers who need to review large shoots without losing control of their own taste.
 
-## Current Capabilities
+It turns a folder of hundreds or thousands of images into a focused review desk: strongest candidates first, risky frames separated, near-duplicates grouped, bursts compared, and Xiaogong ready to reorganize the workspace around the task you ask for.
 
-- Electron + React darkroom-style review workspace.
-- Folder import with recursive image scanning.
-- RAR import through bundled `node-unrar-js`.
-- JPEG, PNG, WebP preview generation through `sharp`.
-- RAW preview generation through Python `rawpy`.
-- HEIC decode attempt through `sharp`, with explicit failure reasons when unsupported.
-- SQLite project state and preview cache under Electron user data.
-- Technical quality scoring for sharpness, exposure, highlight clipping, and shadow clipping.
-- Local face detection with SCRFD/YuNet model paths and stricter OpenCV fallback behavior.
-- OCEC-based eye-state analysis with multi-scale crop voting.
-- Eye states: open, closed, uncertain, not applicable, and unknown.
-- Chinese debug overlay for face boxes, landmarks, and eye crops.
-- Near-duplicate grouping for almost identical images.
-- Similar-burst grouping for action/scene sequences.
-- Group ranking and recommended candidate badges.
-- Manual OpenAI semantic enhancement for selected photos when `OPENAI_API_KEY` is configured.
-- Mock semantic fallback when no OpenAI key is available.
-- Pick, reject, maybe, and star decisions.
-- CSV export to `~/Documents/SenseFrame`.
-- Batch deletion flow that can delete registered original files only after user confirmation.
+## Why SenseFrame
 
-## Setup
+- **Built for real culling work**: import, compare, keep, reject, rate, and export from one focused desktop workspace.
+- **Local-first by default**: original photos stay on your machine, with review state and previews stored separately.
+- **Fast first-pass structure**: technical issues, eye risks, subject issues, duplicates, bursts, and pending frames are separated before you start manual review.
+- **Burst-aware review**: similar frames are grouped so you compare the right photos against each other instead of scrolling endlessly.
+- **Xiaogong as a review co-pilot**: ask it to find the strongest images, review possible mistakes, explain a recommendation, or create a task-specific photo view.
+- **Learns your taste over time**: Xiaogong is designed to learn from accepted suggestions, rejected picks, ratings, exports, and your own review instructions.
+- **Photographer stays in control**: AI organizes and explains; final keep, maybe, reject, rating, and export choices remain yours.
+
+## Key Features
+
+- Import local folders or RAR archives.
+- Generate thumbnails and review previews.
+- Organize photos into candidate, eye review, subject issue, technical issue, duplicate, similar burst, and pending views.
+- Group near-duplicates and similar bursts for faster comparison.
+- Mark photos as keep, maybe, reject, and star ratings.
+- Search and explain photos with semantic context.
+- Run Xiaogong review to let the assistant review the full batch and produce a unified culling result.
+- Create Xiaogong views, such as a ranked list of the images it considers strongest.
+- Let Xiaogong gradually adapt to your review style through feedback and repeated selections.
+- Export selected photos and CSV review lists.
+
+## What Is Xiaogong?
+
+Xiaogong is the photo-review co-pilot inside SenseFrame.
+
+It is not a generic chatbot and not a simple scoring tool. Xiaogong reads the current batch, grouping state, manual decisions, risk signals, and existing review results, then helps organize the workspace around a clear task.
+
+Example requests:
+
+```text
+Find the best-looking photos.
+Review possible closed-eye mistakes.
+Pick one representative from each burst.
+Explain why this photo was recommended.
+```
+
+Xiaogong changes the workspace instead of only replying with text: it can create a Xiaogong view, select the first recommended image, sort the filmstrip, and explain the active photo in the inspector.
+
+Over time, Xiaogong is intended to remember what you accept, reject, rate, export, and explicitly ask for, so future recommendations can better match your own photographic taste.
+
+## Current Status
+
+SenseFrame is under active development. The current version is suitable for local testing and product validation. Signed installers, release automation, auto-update, and deeper Xiaogong memory features are planned.
+
+## Run Locally
 
 ```bash
 pnpm install
-python3 -m venv .venv
-.venv/bin/pip install -r python/requirements.txt
-cp .env.example .env.local
-```
-
-Set `OPENAI_API_KEY` in `.env.local` only if you want real semantic analysis. Local technical, face, eye, and grouping analysis can run without OpenAI.
-
-## Run
-
-```bash
 pnpm dev
 ```
 
-## Build
+Build check:
 
 ```bash
 pnpm build
 ```
-
-For a TypeScript-only check:
-
-```bash
-pnpm exec tsc --noEmit
-```
-
-For a Python worker syntax check:
-
-```bash
-.venv/bin/python -m py_compile python/worker.py
-```
-
-## Data And Safety
-
-SenseFrame reads source photos from their original location and stores app state separately in Electron's user data directory. Preview caches and SQLite rows can be removed through the app.
-
-Deleting a batch can also delete original photo files, but that path is destructive and must be confirmed by the user in the app before it runs.
-
-## Model Notes
-
-The current local vision path is designed for accuracy over real-time speed:
-
-- Face boxes and landmarks prefer local small face models when available.
-- Haar is no longer used as the primary eye decision path.
-- Eye classification uses OCEC-style eye crops and conservative merge rules.
-- No visible face, back view, or environment-only photos are treated as `not_applicable` for eyes, not as closed-eye failures.
-- Small faces, side faces, occlusion, or low-confidence conflicts are kept as reviewable uncertainty instead of automatic rejection.
-
-The longer-term direction is to replace temporary similar-burst heuristics with cached local image embeddings and cosine-similarity grouping.

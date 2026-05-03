@@ -1,0 +1,43 @@
+appId: com.senseframe.desktop
+productName: SenseFrame
+
+directories:
+  output: dist
+
+files:
+  - out/**/*
+  - package.json
+
+extraResources:
+  - from: python
+    to: python
+    filter:
+      - "**/*"
+
+asarUnpack:
+  - "**/*.node"
+
+mac:
+  target:
+    - dmg
+    - zip
+  category: public.app-category.photography
+  hardenedRuntime: false
+  gatekeeperAssess: false
+
+win:
+  target:
+    - nsis
+  artifactName: "${productName}-${version}-${arch}.${ext}"
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+
+publish:
+  provider: github
+  releaseType: draft
+
+npmRebuild: true
+nativeRebuilder: sequential

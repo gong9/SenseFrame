@@ -7,12 +7,16 @@ import type { PhotoAnalysis } from '../shared/types';
 function pythonBin(): string {
   const root = app.getAppPath();
   const local = join(root, '.venv', 'bin', 'python');
-  return existsSync(local) ? local : 'python3';
+  const localWindows = join(root, '.venv', 'Scripts', 'python.exe');
+  if (existsSync(local)) return local;
+  if (existsSync(localWindows)) return localWindows;
+  return process.platform === 'win32' ? 'python' : 'python3';
 }
 
 function workerPath(): string {
   const root = app.getAppPath();
-  return join(root, 'python', 'worker.py');
+  const packaged = join(process.resourcesPath, 'python', 'worker.py');
+  return app.isPackaged && existsSync(packaged) ? packaged : join(root, 'python', 'worker.py');
 }
 
 async function runWorker<T>(args: string[]): Promise<T> {
