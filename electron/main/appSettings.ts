@@ -1,12 +1,13 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { app } from 'electron';
-import type { ModelSettings } from '../shared/types';
+import type { AppLanguage, ModelSettings } from '../shared/types';
 
 const defaultSettings: ModelSettings = {
   baseUrl: 'https://api.openai.com/v1',
   model: 'gpt-5.5',
-  apiKey: ''
+  apiKey: '',
+  language: 'zh-CN'
 };
 
 function settingsPath(): string {
@@ -14,10 +15,12 @@ function settingsPath(): string {
 }
 
 function normalizeSettings(value: Partial<ModelSettings>): ModelSettings {
+  const language = value.language === 'en-US' || value.language === 'zh-CN' ? value.language : defaultSettings.language as AppLanguage;
   return {
     baseUrl: String(value.baseUrl || defaultSettings.baseUrl).trim(),
     model: String(value.model || defaultSettings.model).trim(),
-    apiKey: String(value.apiKey || '').trim()
+    apiKey: String(value.apiKey || '').trim(),
+    language
   };
 }
 
@@ -27,7 +30,8 @@ export function getModelSettings(): ModelSettings {
   return normalizeSettings({
     baseUrl: process.env.OPENAI_BASE_URL || stored.baseUrl,
     model: process.env.OPENAI_MODEL || process.env.OPENAI_VISION_MODEL || stored.model,
-    apiKey: process.env.OPENAI_API_KEY || stored.apiKey
+    apiKey: process.env.OPENAI_API_KEY || stored.apiKey,
+    language: stored.language
   });
 }
 

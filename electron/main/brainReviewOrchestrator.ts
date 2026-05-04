@@ -15,14 +15,18 @@ export async function startBrainReviewThroughRuntime(
   request: BrainRunRequest,
   onProgress?: (event: BrainProgressEvent) => void
 ): Promise<BrainRunResult> {
+  const message = request.language === 'en-US'
+    ? `Run Xiaogong review. Scope: ${request.scope}.${request.focusMode ? ` Focus: ${request.focusMode}` : ''}`
+    : `执行小宫审片。范围：${request.scope}。${request.focusMode ? `重点：${request.focusMode}` : ''}`;
   const output = await runSenseFrameBrainRuntime({
     mode: 'review',
     batchId: request.batchId,
-    message: `执行小宫审片。范围：${request.scope}。${request.focusMode ? `重点：${request.focusMode}` : ''}`,
+    message,
     currentMode: request.focusMode,
     activePhotoId: request.activePhotoId,
     scope: request.scope,
-    focusMode: request.focusMode
+    focusMode: request.focusMode,
+    language: request.language
   }, (progress) => {
     const log = progress.uiLog;
     onProgress?.({

@@ -4,6 +4,7 @@ import type {
   BrainStateWrite,
   BrainUiLogEvent,
   ConfirmationRequest,
+  AppLanguage,
   PhotoExplanation,
   XiaogongRunResult,
   XiaogongToolEventSummary,
@@ -24,6 +25,7 @@ export type BrainRuntimeRequest = {
   smartViewId?: string;
   scope?: 'photo' | 'bucket' | 'group' | 'batch';
   focusMode?: string;
+  language?: AppLanguage;
 };
 
 export type BrainToolContext = {

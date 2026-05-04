@@ -34,6 +34,14 @@ function applyDockIcon(): void {
 
 app.setName('SenseFrame');
 
+function appLanguage(): 'zh-CN' | 'en-US' {
+  return getModelSettings().language === 'en-US' ? 'en-US' : 'zh-CN';
+}
+
+function mainText(zh: string, en: string): string {
+  return appLanguage() === 'en-US' ? en : zh;
+}
+
 function createWindow(): void {
   const iconPath = getAppIconPath();
   const win = new BrowserWindow({
@@ -80,7 +88,7 @@ app.whenReady().then(() => {
     const result = await dialog.showOpenDialog({
       ...(focused ? { window: focused } : {}),
       properties: ['openDirectory', 'dontAddToRecent'],
-      title: '选择照片文件夹'
+      title: mainText('选择照片文件夹', 'Choose Photo Folder')
     } as Electron.OpenDialogOptions);
     console.log('[SenseFrame] chooseFolder result', result.canceled, result.filePaths);
     return result.canceled ? null : result.filePaths[0];
@@ -91,9 +99,9 @@ app.whenReady().then(() => {
     const result = await dialog.showOpenDialog({
       ...(focused ? { window: focused } : {}),
       properties: ['openFile', 'dontAddToRecent'],
-      title: '选择 RAR 压缩包',
+      title: mainText('选择 RAR 压缩包', 'Choose RAR Archive'),
       filters: [
-        { name: 'RAR archive', extensions: ['rar'] }
+        { name: mainText('RAR 压缩包', 'RAR archive'), extensions: ['rar'] }
       ]
     } as Electron.OpenDialogOptions);
     console.log('[SenseFrame] chooseArchive result', result.canceled, result.filePaths);
@@ -160,7 +168,7 @@ app.whenReady().then(() => {
     const result = await dialog.showOpenDialog({
       ...(focused ? { window: focused } : {}),
       properties: ['openDirectory', 'createDirectory', 'dontAddToRecent'],
-      title: '选择导出已选照片的位置'
+      title: mainText('选择导出已选照片的位置', 'Choose Export Folder for Selected Photos')
     } as Electron.OpenDialogOptions);
     if (result.canceled || !result.filePaths[0]) return null;
 

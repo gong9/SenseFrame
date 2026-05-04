@@ -43,39 +43,29 @@ import type {
   XiaogongProgressEvent,
   XiaogongRunResult
 } from '../electron/shared/types';
+import { createTranslator, normalizeLanguage } from './i18n';
 import './styles.css';
 
 type ViewMode = 'featured' | 'keepers' | 'lowPriority' | 'reviewQueue' | 'closedEyes' | 'eyeReview' | 'subject' | 'technical' | 'duplicates' | 'similarBursts' | 'pending' | 'search' | 'smartView';
+type Translator = ReturnType<typeof createTranslator>;
 
 function pct(value?: number): string {
   return `${Math.round((value || 0) * 100)}`;
 }
 
-function decisionLabel(decision: Decision): string {
-  const labels: Record<Decision, string> = {
-    none: '未标记',
-    pick: '已保留',
-    reject: '已淘汰',
-    maybe: '待复核'
-  };
-  return labels[decision];
+function decisionLabel(decision: Decision, t: Translator): string {
+  return t(`decision.${decision}`);
 }
 
-function riskLabel(flag: string): string {
-  const labels: Record<string, string> = {
-    possible_blur: '疑似模糊',
-    bad_exposure: '曝光异常',
-    closed_eyes: '疑似闭眼',
-    eyes_uncertain: '眼部不确定',
-    face_blur: '人脸不够清晰',
-    face_missing: '未检测到人脸（信息）',
-    subject_cropped: '主体被裁切',
-    weak_subject: '主体不明确',
-    unsupported_preview: '预览不可用',
-    raw_decode_failed: 'RAW 解析失败',
-    heic_decode_failed: 'HEIC 解析失败'
-  };
-  return labels[flag] || flag;
+function riskLabel(flag: string, t: Translator): string {
+  const label = t(`risk.${flag}`);
+  return label === `risk.${flag}` ? flag : label;
+}
+
+function localizeTechnicalMessage(message: string, t: Translator): string {
+  return productReviewText(message, t)
+    .replace(/正在/g, t('import.waiting').replace('...', ''))
+    .trim();
 }
 
 const eyeFlags = new Set(['closed_eyes', 'eyes_uncertain']);
@@ -293,7 +283,7 @@ function App(): React.ReactElement {
   const [importProgress, setImportProgress] = useState<ImportProgress | null>(null);
   const [notice, setNotice] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [modelSettings, setModelSettings] = useState<ModelSettings>({ baseUrl: 'https://api.openai.com/v1', model: 'gpt-5.5', apiKey: '' });
+  const [modelSettings, setModelSettings] = useState<ModelSettings>({ baseUrl: 'https://api.openai.com/v1', model: 'gpt-5.5', apiKey: '', language: 'zh-CN' });
   const [settingsDraft, setSettingsDraft] = useState<ModelSettings>(modelSettings);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [query, setQuery] = useState('');
@@ -307,6 +297,8 @@ function App(): React.ReactElement {
   const activeBatchIdRef = useRef<string | null>(null);
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   const [imageSize, setImageSize] = useState({ width: 0, height: 0 });
+  const language = normalizeLanguage(modelSettings.language);
+  const t = useMemo(() => createTranslator(language), [language]);
 
   useEffect(() => {
     if (!notice) return;
@@ -338,7 +330,7 @@ function App(): React.ReactElement {
       setModelSettings(next);
       setSettingsDraft(next);
       setSettingsOpen(false);
-      setNotice(next.apiKey ? '模型设置已保存，小宫会使用新的模型配置。' : '模型设置已保存，但 API Key 为空。');
+      setNotice(next.apiKey ? t('settings.savedWithKey') : t('settings.savedWithoutKey'));
     } finally {
       setSettingsSaving(false);
     }
@@ -378,9 +370,9 @@ function App(): React.ReactElement {
 
   async function removeBatch(id: string, name: string): Promise<void> {
     if (!window.senseframe) return;
-    const confirmed = window.confirm(
-      `删除批次「${name}」并删除本地原片？\n\n这会删除 SenseFrame 记录、分析结果、预览缓存，以及这个批次里登记的本地照片文件。原片删除后不能从 SenseFrame 恢复。`
-    );
+    const confirmed = window.confirm(language === 'en-US'
+      ? `Delete batch "${name}" and its local originals?\n\nThis removes SenseFrame records, analysis results, preview cache, and the local photo files registered in this batch. Originals cannot be restored from SenseFrame.`
+      : `删除批次「${name}」并删除本地原片？\n\n这会删除 SenseFrame 记录、分析结果、预览缓存，以及这个批次里登记的本地照片文件。原片删除后不能从 SenseFrame 恢复。`);
     if (!confirmed) return;
     const result = await window.senseframe.deleteBatch({ batchId: id, deleteOriginals: true });
     if (batch?.id === id) {
@@ -392,20 +384,20 @@ function App(): React.ReactElement {
     await refreshBatches();
     setNotice(
       result.failedOriginals
-        ? `批次已删除，原片删除 ${result.deletedOriginals} 张，失败 ${result.failedOriginals} 张。`
-        : `批次已删除，原片删除 ${result.deletedOriginals} 张。`
+        ? (language === 'en-US' ? `Batch deleted. Deleted ${result.deletedOriginals} originals, ${result.failedOriginals} failed.` : `批次已删除，原片删除 ${result.deletedOriginals} 张，失败 ${result.failedOriginals} 张。`)
+        : (language === 'en-US' ? `Batch deleted. Deleted ${result.deletedOriginals} originals.` : `批次已删除，原片删除 ${result.deletedOriginals} 张。`)
     );
   }
 
   async function rebuildCurrentClusters(): Promise<void> {
     if (!batch || !window.senseframe) return;
-    setBusy('正在按近重复规则重建分组...');
+    setBusy(language === 'en-US' ? 'Rebuilding near-duplicate groups...' : '正在按近重复规则重建分组...');
     try {
       const next = await window.senseframe.rebuildClusters(batch.id);
       setBatch(next);
       setMode('duplicates');
       setPhotoIndex(0);
-      setNotice('近重复分组已重建。');
+      setNotice(language === 'en-US' ? 'Near-duplicate groups rebuilt.' : '近重复分组已重建。');
     } finally {
       setBusy('');
     }
@@ -413,12 +405,12 @@ function App(): React.ReactElement {
 
   async function reanalyzeCurrentBatch(): Promise<void> {
     if (!batch || !window.senseframe) return;
-    setBusy('正在用原图重跑人脸与眼部分析...');
+    setBusy(language === 'en-US' ? 'Rerunning face and eye analysis from originals...' : '正在用原图重跑人脸与眼部分析...');
     try {
       const next = await window.senseframe.reanalyzeBatch(batch.id);
       setBatch(next);
       setPhotoIndex(0);
-      setNotice('已用原图重跑人脸与眼部分析。');
+      setNotice(language === 'en-US' ? 'Face and eye analysis rerun from originals.' : '已用原图重跑人脸与眼部分析。');
     } finally {
       setBusy('');
     }
@@ -430,7 +422,8 @@ function App(): React.ReactElement {
     if (!window.senseframe) return;
     const offImport = window.senseframe.onImportProgress((progress) => {
       setImportProgress(progress);
-      setBusy(progress.total ? `${progress.message} ${progress.current || 0}/${progress.total}` : progress.message);
+      const message = localizeTechnicalMessage(progress.message, t);
+      setBusy(progress.total ? `${message} ${progress.current || 0}/${progress.total}` : message);
     });
     const offBrain = window.senseframe.onBrainProgress((progress) => {
       setBrainProgress(progress);
@@ -457,7 +450,7 @@ function App(): React.ReactElement {
       offBrain();
       offXiaogong();
     };
-  }, []);
+  }, [language, t]);
 
   const duplicateIds = useMemo(() => (batch ? duplicatePhotoIds(batch) : new Set<string>()), [batch]);
   const clusterMeta = useMemo(() => (batch ? clusterMetaByPhoto(batch) : new Map<string, ClusterMeta>()), [batch]);
@@ -485,78 +478,78 @@ function App(): React.ReactElement {
     const buckets: Array<{ id: ViewMode; label: string; description: string; count: number; icon: React.ReactNode }> = [
       {
         id: 'featured',
-        label: '精选候选',
-        description: hasBrainCuration ? '大脑最终优先看的照片' : '每段优先看的照片',
+        label: t('buckets.featured'),
+        description: hasBrainCuration ? t('bucketDescriptions.featuredBrain') : t('bucketDescriptions.featuredLocal'),
         count: featuredIds.size,
         icon: <Sparkles size={16} />
       },
       {
         id: 'keepers',
-        label: '建议保留',
-        description: hasBrainCuration ? '质量过线、无需复核的 keeper' : '运行小宫审片后生成',
+        label: t('buckets.keepers'),
+        description: hasBrainCuration ? t('bucketDescriptions.keepersBrain') : t('bucketDescriptions.generatedByXiaogong'),
         count: hasBrainCuration ? brainBucketCount('keepers') : 0,
         icon: <Check size={16} />
       },
       {
         id: 'lowPriority',
-        label: '低优先级备选',
-        description: hasBrainCuration ? '有保留价值但不强' : '运行小宫审片后生成',
+        label: t('buckets.lowPriority'),
+        description: hasBrainCuration ? t('bucketDescriptions.lowPriorityBrain') : t('bucketDescriptions.generatedByXiaogong'),
         count: hasBrainCuration ? brainBucketCount('lowPriority') : 0,
         icon: <Star size={16} />
       },
       {
         id: 'reviewQueue',
-        label: '人工复核',
-        description: hasBrainCuration ? '眼神、焦点或语义需确认' : '运行小宫审片后生成',
+        label: t('buckets.reviewQueue'),
+        description: hasBrainCuration ? t('bucketDescriptions.reviewQueueBrain') : t('bucketDescriptions.generatedByXiaogong'),
         count: hasBrainCuration ? brainBucketCount('reviewQueue') : 0,
         icon: <Brain size={16} />
       },
       {
         id: 'closedEyes',
-        label: '疑似闭眼',
-        description: hasBrainCuration ? '大脑确认更像失败闭眼' : '双眼高置信闭合',
+        label: t('buckets.closedEyes'),
+        description: hasBrainCuration ? t('bucketDescriptions.closedEyesBrain') : t('bucketDescriptions.closedEyesLocal'),
         count: hasBrainCuration ? brainBucketCount('closedEyes') : batch.photos.filter((photo) => hasAnyFlag(photo, closedEyeFlags)).length,
         icon: <Eye size={16} />
       },
       {
         id: 'eyeReview',
-        label: '眼部复核',
-        description: hasBrainCuration ? '大脑认为需要人工看眼部' : '侧脸、远景或遮挡',
+        label: t('buckets.eyeReview'),
+        description: hasBrainCuration ? t('bucketDescriptions.eyeReviewBrain') : t('bucketDescriptions.eyeReviewLocal'),
         count: hasBrainCuration ? brainBucketCount('eyeReview') : batch.photos.filter((photo) => hasAnyFlag(photo, eyeReviewFlags)).length,
         icon: <Eye size={16} />
       },
       {
         id: 'subject',
-        label: '主体问题',
-        description: hasBrainCuration ? '大脑确认主体/构图风险' : '裁切或主体弱',
+        label: t('buckets.subject'),
+        description: hasBrainCuration ? t('bucketDescriptions.subjectBrain') : t('bucketDescriptions.subjectLocal'),
         count: hasBrainCuration ? brainBucketCount('subject') : batch.photos.filter((photo) => hasAnyFlag(photo, subjectFlags)).length,
         icon: <ImageIcon size={16} />
       },
       {
         id: 'technical',
-        label: '技术问题',
-        description: hasBrainCuration ? '大脑确认技术风险' : '模糊、曝光、解析失败',
+        label: t('buckets.technical'),
+        description: hasBrainCuration ? t('bucketDescriptions.technicalBrain') : t('bucketDescriptions.technicalLocal'),
         count: hasBrainCuration ? brainBucketCount('technical') : batch.photos.filter((photo) => hasAnyFlag(photo, technicalFlags) || photo.status !== 'ready').length,
         icon: <TriangleAlert size={16} />
       },
       {
         id: 'duplicates',
-        label: '近重复',
-        description: hasBrainCuration ? '大脑组内排序后的近重复' : '构图几乎一致的照片',
+        label: t('buckets.duplicates'),
+        description: hasBrainCuration ? t('bucketDescriptions.duplicatesBrain') : t('bucketDescriptions.duplicatesLocal'),
         count: hasBrainCuration ? brainBucketCount('duplicates') : duplicateIds.size,
         icon: <Layers size={16} />
       },
       {
         id: 'similarBursts',
-        label: '相似连拍',
-        description: '同一动作段的照片',
+        label: t('buckets.similarBursts'),
+        description: t('bucketDescriptions.similarBursts'),
         count: hasBrainCuration ? brainBucketCount('similarBursts') : burstMeta.size,
         icon: <Layers size={16} />
       },
       {
         id: 'pending',
-        label: '待判断',
-        description: hasBrainCuration ? '大脑明确留给人工判断' : 'AI 不确定，建议人工看',
+        label: t('buckets.pending'),
+        description: hasBrainCuration ? t('bucketDescriptions.pendingBrain') : t('bucketDescriptions.pendingLocal'),
         count: hasBrainCuration ? brainBucketCount('pending') : batch.photos.filter((photo) => {
           const flags = photo.analysis?.riskFlags || [];
           return photo.analysis?.eyeState === 'uncertain' || photo.analysis?.faceVisibility === 'unknown' || (flags.length > 0 && !featuredIds.has(photo.id));
@@ -565,7 +558,7 @@ function App(): React.ReactElement {
       }
     ];
     return buckets;
-  }, [batch, duplicateIds, burstMeta, featuredIds, hasBrainCuration]);
+  }, [batch, duplicateIds, burstMeta, featuredIds, hasBrainCuration, t]);
   const activeBucket = bucketDefs.find((bucket) => bucket.id === mode);
   const visiblePhotos = useMemo(() => {
     if (!batch) return [];
@@ -732,32 +725,34 @@ function App(): React.ReactElement {
   async function importSource(kind: 'folder' | 'archive' = 'folder'): Promise<void> {
     if (importProgress) return;
     if (!window.senseframe) {
-      setNotice('当前是浏览器预览页面。请使用 Electron 弹出的 SenseFrame 桌面窗口导入素材。');
+      setNotice(language === 'en-US' ? 'Please use the SenseFrame desktop window to import assets.' : '请在 SenseFrame 桌面端窗口中导入素材。');
       return;
     }
     setImportProgress({
       stage: kind === 'archive' ? 'extracting' : 'scanning',
-      message: kind === 'archive' ? '正在打开 RAR 选择框...' : '正在打开文件夹选择框...'
+      message: kind === 'archive' ? t('import.openingArchive') : t('import.openingFolder')
     });
     const source = kind === 'archive' ? await window.senseframe.chooseArchive() : await window.senseframe.chooseFolder();
     if (!source) {
-      setNotice('已取消选择。');
+      setNotice(t('import.cancelled'));
       setImportProgress(null);
       return;
     }
-    setBusy(source.toLowerCase().endsWith('.rar') ? '正在解压 RAR 并分析照片...' : '正在导入与分析照片，RAW/HEIC 和人脸检测会调用 Python worker...');
+    setBusy(source.toLowerCase().endsWith('.rar') ? t('import.extractingBusy') : t('import.importingBusy'));
     setImportProgress({
       stage: source.toLowerCase().endsWith('.rar') ? 'extracting' : 'scanning',
-      message: source.toLowerCase().endsWith('.rar') ? '正在解压 RAR 并准备分析...' : '正在扫描照片...'
+      message: source.toLowerCase().endsWith('.rar') ? t('import.extracting') : t('import.scanning')
     });
     try {
       const result = await window.senseframe.importSource(source);
       await refreshBatches();
       await loadBatch(result.batchId);
-      setNotice(`${result.sourceType === 'archive' ? 'RAR 解压并导入完成' : '导入完成'}：${result.imported} 张，预览失败/受限 ${result.unsupported} 张`);
+      setNotice(result.sourceType === 'archive'
+        ? t('import.doneArchive', { imported: result.imported, unsupported: result.unsupported })
+        : t('import.doneFolder', { imported: result.imported, unsupported: result.unsupported }));
     } catch (error) {
       const hint = await window.senseframe.workerHint();
-      setNotice(`${error instanceof Error ? error.message : String(error)}。${hint}`);
+      setNotice(`${error instanceof Error ? error.message : String(error)}${language === 'en-US' ? '. ' : '。'}${hint}`);
     } finally {
       setBusy('');
       setImportProgress(null);
@@ -800,7 +795,7 @@ function App(): React.ReactElement {
   async function analyzeSemantic(): Promise<void> {
     if (!batch || !activePhoto) return;
     if (!window.senseframe) return;
-    setBusy('正在生成语义标签与推荐解释...');
+    setBusy(language === 'en-US' ? 'Generating semantic tags and recommendation notes...' : '正在生成语义标签和推荐说明...');
     try {
       await window.senseframe.analyzeSemantic({ batchId: batch.id, photoId: activePhoto.id });
       await loadBatch(batch.id);
@@ -812,7 +807,7 @@ function App(): React.ReactElement {
   async function runSearch(): Promise<void> {
     if (!batch || !query.trim()) return;
     if (!window.senseframe) return;
-    setBusy('正在语义搜索...');
+    setBusy(language === 'en-US' ? 'Searching semantically...' : '正在语义搜索...');
     try {
       const searchResults = await window.senseframe.search({ batchId: batch.id, query });
       setResults(searchResults);
@@ -827,24 +822,24 @@ function App(): React.ReactElement {
     if (!batch) return;
     if (!window.senseframe) return;
     const path = await window.senseframe.exportCsv(batch.id);
-    setNotice(`已导出：${path}`);
+    setNotice(language === 'en-US' ? `Exported: ${path}` : `已导出：${path}`);
   }
 
   async function exportSelected(): Promise<void> {
     if (!batch) return;
     if (!window.senseframe) return;
     if (!stats.picked) {
-      setNotice('还没有标记为“保留”的照片。');
+      setNotice(language === 'en-US' ? 'No photos are marked as kept yet.' : '还没有标记为“保留”的照片。');
       return;
     }
 
     const result = await window.senseframe.exportSelected(batch.id);
-    if (result) setNotice(`已导出 ${result.count} 张已选照片：${result.dir}`);
+    if (result) setNotice(language === 'en-US' ? `Exported ${result.count} selected photos: ${result.dir}` : `已导出 ${result.count} 张已选照片：${result.dir}`);
   }
 
   async function runBrainReview(): Promise<void> {
     if (!batch || !window.senseframe || !batch.photos.length) return;
-    setBrainBusy(`小宫正在接管整批审片 · ${batch.photos.length} 张...`);
+    setBrainBusy(t('xiaogong.busyReview', { count: batch.photos.length }));
     setBrainProgress(null);
     setBrainActivity([]);
     setLastBrainRun(null);
@@ -853,7 +848,8 @@ function App(): React.ReactElement {
         batchId: batch.id,
         scope: 'batch',
         focusMode: mode,
-        activePhotoId: activePhoto?.id
+        activePhotoId: activePhoto?.id,
+        language
       });
       setLastBrainRun(result);
       await loadBatch(batch.id, { resetView: true });
@@ -864,9 +860,9 @@ function App(): React.ReactElement {
       } else {
         setMode(result.status === 'completed' ? 'keepers' : mode === 'smartView' ? 'featured' : mode);
       }
-      setNotice(result.status === 'completed' ? result.uiPatch?.notice || result.message : `小宫审片失败：${result.message}`);
+      setNotice(result.status === 'completed' ? result.uiPatch?.notice || result.message : t('xiaogong.reviewFailed', { message: result.message }));
     } catch (error) {
-      setNotice(`小宫审片失败：${error instanceof Error ? error.message : String(error)}`);
+      setNotice(t('xiaogong.reviewFailed', { message: error instanceof Error ? error.message : String(error) }));
     } finally {
       setBrainBusy('');
     }
@@ -882,7 +878,7 @@ function App(): React.ReactElement {
 
   async function runXiaogong(message: string = xiaogongInput): Promise<void> {
     if (!batch || !window.senseframe || !message.trim()) return;
-    setXiaogongBusy('正在交给小宫...');
+    setXiaogongBusy(t('xiaogong.handoff'));
     setXiaogongProgress(null);
     setXiaogongActivity([]);
     setLastXiaogongResult(null);
@@ -892,7 +888,8 @@ function App(): React.ReactElement {
         message: message.trim(),
         currentMode: mode,
         activePhotoId: activePhoto?.id,
-        smartViewId: activeSmartView?.id
+        smartViewId: activeSmartView?.id,
+        language
       });
       setLastXiaogongResult(result);
       setXiaogongProgress(null);
@@ -905,7 +902,7 @@ function App(): React.ReactElement {
       setNotice(result.uiPatch?.notice || result.message);
       setXiaogongInput('');
     } catch (error) {
-      setNotice(`小宫任务失败：${error instanceof Error ? error.message : String(error)}`);
+      setNotice(t('xiaogong.taskFailed', { message: error instanceof Error ? error.message : String(error) }));
     } finally {
       setXiaogongBusy('');
     }
@@ -919,17 +916,17 @@ function App(): React.ReactElement {
       await window.senseframe.recordBrainFeedback({ photoId: activePhoto.id, runId: review.runId, action: 'accepted', note: review.recommendedAction });
       await window.senseframe.saveDecision({ batchId: batch.id, photoId: activePhoto.id, decision: review.recommendedAction });
       await loadBatch(batch.id, { preserveSmartViewId, preservePhotoId, resetView: !preserveSmartViewId });
-      setNotice('已按大脑建议更新标记。');
+      setNotice(t('xiaogong.acceptedNotice'));
       return;
     }
     await window.senseframe.recordBrainFeedback({ photoId: activePhoto.id, runId: review.runId, action: 'reviewed', note: 'no direct decision' });
-    setNotice('已记录大脑建议为人工复核。');
+    setNotice(t('xiaogong.reviewNotice'));
   }
 
   async function rejectBrainSuggestion(review: BrainPhotoReview, note?: string): Promise<void> {
     if (!activePhoto || !window.senseframe) return;
     await window.senseframe.recordBrainFeedback({ photoId: activePhoto.id, runId: review.runId, action: 'rejected', note: note?.trim() || undefined });
-    setNotice(note?.trim() ? '已记录不采纳和理由。' : '已记录不采纳这条大脑评价。');
+    setNotice(note?.trim() ? t('xiaogong.rejectedWithNoteNotice') : t('xiaogong.rejectedNotice'));
   }
 
   useEffect(() => {
@@ -967,35 +964,35 @@ function App(): React.ReactElement {
 
         <div className="import-actions">
           <button className="primary-action" onClick={() => importSource('folder')} disabled={Boolean(importProgress)}>
-            <FolderOpen size={16} /> 导入
+            <FolderOpen size={16} /> {t('actions.import')}
           </button>
           <button className="secondary-action" onClick={() => importSource('archive')} disabled={Boolean(importProgress)}>RAR</button>
         </div>
 
         {batch && (
           <div className="stats">
-            <Metric label="总数" value={batch.photos.length} />
-            <Metric label="精选" value={stats.candidates} />
-            <Metric label="复核" value={stats.review} />
-            <Metric label="已选" value={stats.picked} />
-            <button className="mini-tool" onClick={rebuildCurrentClusters}>重建近重复</button>
-            <button className="mini-tool" onClick={reanalyzeCurrentBatch}>重跑分析</button>
+            <Metric label={t('sidebar.total')} value={batch.photos.length} />
+            <Metric label={t('sidebar.featured')} value={stats.candidates} />
+            <Metric label={t('sidebar.review')} value={stats.review} />
+            <Metric label={t('sidebar.selected')} value={stats.picked} />
+            <button className="mini-tool" onClick={rebuildCurrentClusters}>{t('actions.rebuildClusters')}</button>
+            <button className="mini-tool" onClick={reanalyzeCurrentBatch}>{t('actions.reanalyze')}</button>
           </div>
         )}
 
         <div className="batch-list">
-          <div className="section-label">批次</div>
+          <div className="section-label">{t('sidebar.batches')}</div>
           {batches.map((item, index) => (
             <div key={item.id} className={`batch-item ${batch?.id === item.id ? 'active' : ''}`}>
               <button className="batch-open" onClick={() => loadBatch(item.id)}>
-                <span>批次 {String(index + 1).padStart(2, '0')}</span>
+                <span>{t('sidebar.batch', { index: String(index + 1).padStart(2, '0') })}</span>
                 <small>{item.name}</small>
               </button>
               <span className="batch-count">{item.totalPhotos}</span>
               <button
                 className="batch-delete"
-                title="删除批次"
-                aria-label={`删除批次 ${item.name}`}
+                title={t('actions.deleteBatch')}
+                aria-label={`${t('actions.deleteBatch')} ${item.name}`}
                 onClick={() => removeBatch(item.id, item.name)}
               >
                 <Trash2 size={15} />
@@ -1006,7 +1003,7 @@ function App(): React.ReactElement {
 
         {batch && (
           <div className="ai-buckets">
-            <div className="section-label">AI 分组</div>
+            <div className="section-label">{t('sidebar.aiBuckets')}</div>
             {bucketDefs.map((bucket) => (
               <button
                 key={bucket.id}
@@ -1029,7 +1026,7 @@ function App(): React.ReactElement {
 
         {batch && smartViews.length > 0 && (
           <div className="xiaogong-views">
-            <div className="section-label">小宫视图</div>
+            <div className="section-label">{t('sidebar.xiaogongViews')}</div>
             {smartViews.map((view) => (
               <button
                 key={view.id}
@@ -1052,35 +1049,35 @@ function App(): React.ReactElement {
         <header className="topbar">
           <div className="topbar-title">
             {batch && (
-              <button className="home-command" onClick={goHome} title="返回首页" aria-label="返回首页">
+              <button className="home-command" onClick={goHome} title={t('actions.home')} aria-label={t('actions.home')}>
                 <Home size={15} />
-                <span>首页</span>
+                <span>{t('actions.home')}</span>
               </button>
             )}
             <div>
-              <h1>{batch ? `${mode === 'smartView' ? activeSmartView?.name || '小宫视图' : activeBucket?.label || '语义搜索'} · ${visiblePhotos.length}` : '选择一个拍摄批次开始'}</h1>
-              <p>{batch ? (mode === 'smartView' && activeSmartView ? activeSmartView.summary : `${batch.name} · ${batch.clusters.length} 个相似组 · ${stats.rejected} 张淘汰建议已确认`) : '导入后会自动生成缩略图、RAW 预览、质量分、人脸闭眼检测和相似组。'}</p>
+              <h1>{batch ? `${mode === 'smartView' ? activeSmartView?.name || t('sidebar.xiaogongViews') : activeBucket?.label || t('topbar.search')} · ${visiblePhotos.length}` : t('topbar.titleEmpty')}</h1>
+              <p>{batch ? (mode === 'smartView' && activeSmartView ? activeSmartView.summary : t('topbar.batchSummary', { name: batch.name, clusters: batch.clusters.length, rejected: stats.rejected })) : t('topbar.subtitleEmpty')}</p>
             </div>
           </div>
           <div className="toolbar">
             {batch && (
               <>
-              <button className="brain-action" onClick={runBrainReview} disabled={Boolean(brainBusy || busy)} title="小宫审片">
-                {brainBusy ? <Loader2 className="spin" size={16} /> : <Brain size={16} />} 小宫
+              <button className="brain-action" onClick={runBrainReview} disabled={Boolean(brainBusy || busy)} title={t('xiaogong.reviewTitle')}>
+                {brainBusy ? <Loader2 className="spin" size={16} /> : <Brain size={16} />} {t('xiaogong.reviewButton')}
               </button>
-              <button onClick={exportSelected} title="导出已选"><Download size={16} /> 导出</button>
-              <button
-                className={!modelSettings.apiKey ? 'needs-settings' : ''}
-                onClick={() => {
-                  setSettingsDraft(modelSettings);
-                  setSettingsOpen(true);
-                }}
-                title="模型设置"
-              >
-                <Settings size={16} /> 设置
-              </button>
+              <button onClick={exportSelected} title={t('actions.exportSelected')}><Download size={16} /> {t('actions.export')}</button>
               </>
             )}
+            <button
+              className={!modelSettings.apiKey ? 'needs-settings' : ''}
+              onClick={() => {
+                setSettingsDraft(modelSettings);
+                setSettingsOpen(true);
+              }}
+              title={t('settings.title')}
+            >
+              <Settings size={16} /> {t('actions.settings')}
+            </button>
           </div>
         </header>
 
@@ -1092,6 +1089,7 @@ function App(): React.ReactElement {
             onOpenBatch={loadBatch}
             onRemoveBatch={removeBatch}
             disabled={Boolean(importProgress)}
+            t={t}
           />
         ) : (
           <div className="main-grid">
@@ -1106,7 +1104,7 @@ function App(): React.ReactElement {
                 >
                 {canvasPhoto && (
                   <div className="canvas-hud">
-                    <span>{mode === 'smartView' ? activeSmartView?.name || '小宫视图' : activeBucket?.label || '审片'}</span>
+                    <span>{mode === 'smartView' ? activeSmartView?.name || t('sidebar.xiaogongViews') : activeBucket?.label || t('topbar.review')}</span>
                     <strong>{canvasPhoto.fileName}</strong>
                     <em>{visiblePhotos.length ? `${canvasPhotoIndex >= 0 ? canvasPhotoIndex + 1 : Math.min(photoIndex + 1, visiblePhotos.length)} / ${visiblePhotos.length}` : '0 / 0'}</em>
                   </div>
@@ -1131,18 +1129,18 @@ function App(): React.ReactElement {
                     {debugMode && <DebugOverlay photo={canvasPhoto} />}
                   </div>
                 ) : visiblePhotos.length === 0 ? (
-                  <div className="missing-preview"><Layers size={46} />当前分组没有照片</div>
+                  <div className="missing-preview"><Layers size={46} />{t('photo.missingGroup')}</div>
                 ) : (
-                  <div className="missing-preview"><ImageIcon size={46} />预览不可用</div>
+                  <div className="missing-preview"><ImageIcon size={46} />{t('photo.previewUnavailable')}</div>
                 )}
                 {activePhoto?.previewPath && (
-                  <div className="zoom-controls" aria-label="图片缩放" onPointerDown={(event) => event.stopPropagation()}>
-                    <button title="缩小" onClick={() => setZoom(imageZoom - 0.25)}>
+                  <div className="zoom-controls" aria-label={language === 'en-US' ? 'Image zoom' : '图片缩放'} onPointerDown={(event) => event.stopPropagation()}>
+                    <button title={t('actions.zoomOut')} onClick={() => setZoom(imageZoom - 0.25)}>
                       <ZoomOut size={16} />
                     </button>
-                    <button className={isFitZoom ? 'selected' : ''} onClick={() => { setImageZoom(1); setImagePan({ x: 0, y: 0 }); }}>适屏</button>
+                    <button className={isFitZoom ? 'selected' : ''} onClick={() => { setImageZoom(1); setImagePan({ x: 0, y: 0 }); }}>{t('actions.fit')}</button>
                     <button className="zoom-value">{Math.round(imageZoom * 100)}%</button>
-                    <button title="放大" onClick={() => setZoom(imageZoom + 0.25)}>
+                    <button title={t('actions.zoomIn')} onClick={() => setZoom(imageZoom + 0.25)}>
                       <ZoomIn size={16} />
                     </button>
                   </div>
@@ -1159,9 +1157,9 @@ function App(): React.ReactElement {
                       className={`thumb ${index === photoIndex ? 'active' : ''} ${photo.decision} ${meta || burst ? 'clustered' : ''} ${featured ? 'cluster-best' : ''}`}
                       title={
                         meta
-                          ? `近重复 G${meta.clusterNumber} · 第 ${meta.rank}/${meta.clusterSize} · 相似 ${pct(meta.similarityToBest)}`
-                          : burst
-                            ? `相似连拍 B${burst.burstNumber} ${burst.label} · 第 ${burst.rank}/${burst.burstSize}`
+                            ? t('photo.duplicate', { group: meta.clusterNumber, rank: meta.rank, size: meta.clusterSize, similarity: pct(meta.similarityToBest) })
+                            : burst
+                            ? t('photo.burst', { group: burst.burstNumber, label: burst.label, rank: burst.rank, size: burst.burstSize })
                             : photo.fileName
                       }
                       onClick={() => setPhotoIndex(index)}
@@ -1171,7 +1169,7 @@ function App(): React.ReactElement {
                       {!meta && burst && <span className="cluster-badge burst">B{burst.burstNumber}</span>}
                       {meta && <span className="rank-badge">{meta.rank}/{meta.clusterSize}</span>}
                       {!meta && burst && <span className="rank-badge">{burst.rank}/{burst.burstSize}</span>}
-                      {featured && <span className="badge">精选</span>}
+                      {featured && <span className="badge">{t('photo.featuredBadge')}</span>}
                       {mode === 'smartView' && activeSmartView && <span className="smart-rank">#{index + 1}</span>}
                     </button>
                   );
@@ -1183,13 +1181,13 @@ function App(): React.ReactElement {
               {activeClusterMeta && (
                 <div className="cluster-note">
                   <strong>近重复 G{activeClusterMeta.clusterNumber}</strong>
-                  <span>第 {activeClusterMeta.rank}/{activeClusterMeta.clusterSize} · 相似 {pct(activeClusterMeta.similarityToBest)} · {activeClusterMeta.recommended ? '组内推荐' : '备选'}</span>
+                  <span>{language === 'en-US' ? `${activeClusterMeta.rank}/${activeClusterMeta.clusterSize} · similarity ${pct(activeClusterMeta.similarityToBest)} · ${activeClusterMeta.recommended ? t('photo.groupRecommended') : t('photo.backup')}` : `第 ${activeClusterMeta.rank}/${activeClusterMeta.clusterSize} · 相似 ${pct(activeClusterMeta.similarityToBest)} · ${activeClusterMeta.recommended ? t('photo.groupRecommended') : t('photo.backup')}`}</span>
                 </div>
               )}
               {activeBurstMeta && !activeClusterMeta && (
                 <div className="cluster-note">
-                  <strong>相似连拍 B{activeBurstMeta.burstNumber}</strong>
-                  <span>{activeBurstMeta.label} · 第 {activeBurstMeta.rank}/{activeBurstMeta.burstSize}</span>
+                  <strong>{t('buckets.similarBursts')} B{activeBurstMeta.burstNumber}</strong>
+                  <span>{language === 'en-US' ? `${activeBurstMeta.label} · ${activeBurstMeta.rank}/${activeBurstMeta.burstSize}` : `${activeBurstMeta.label} · 第 ${activeBurstMeta.rank}/${activeBurstMeta.burstSize}`}</span>
                 </div>
               )}
               <BrainActivityPanel
@@ -1197,12 +1195,14 @@ function App(): React.ReactElement {
                 activity={brainActivity}
                 active={Boolean(brainBusy)}
                 lastRun={lastBrainRun}
+                t={t}
               />
               <PhotoPanel
                 photo={activePhoto}
                 onDecide={decide}
                 onApplyBrainSuggestion={applyBrainSuggestion}
                 onRejectBrainSuggestion={rejectBrainSuggestion}
+                t={t}
               />
               <XiaogongConsole
                 busy={xiaogongBusy}
@@ -1213,6 +1213,7 @@ function App(): React.ReactElement {
                 activeItem={activeSmartViewItem}
                 onInput={setXiaogongInput}
                 onRun={runXiaogong}
+                t={t}
               />
             </aside>
           </div>
@@ -1221,7 +1222,7 @@ function App(): React.ReactElement {
         {notice && (
           <div className="notice" role="status">
             <span>{notice}</span>
-            <button type="button" aria-label="关闭提示" onClick={() => setNotice('')}>
+            <button type="button" aria-label={t('actions.close')} onClick={() => setNotice('')}>
               <X size={14} />
             </button>
           </div>
@@ -1236,9 +1237,10 @@ function App(): React.ReactElement {
               setSettingsOpen(false);
             }}
             onSave={saveSettings}
+            t={t}
           />
         )}
-        {importProgress && <ImportOverlay progress={importProgress} />}
+        {importProgress && <ImportOverlay progress={importProgress} t={t} />}
       </section>
     </main>
   );
@@ -1249,13 +1251,15 @@ function ModelSettingsDialog({
   saving,
   onChange,
   onCancel,
-  onSave
+  onSave,
+  t
 }: {
   value: ModelSettings;
   saving: boolean;
   onChange: (value: ModelSettings) => void;
   onCancel: () => void;
   onSave: () => void;
+  t: Translator;
 }): React.ReactElement {
   const canSave = Boolean(value.baseUrl.trim() && value.model.trim());
   const configured = Boolean(value.apiKey.trim());
@@ -1267,26 +1271,26 @@ function ModelSettingsDialog({
           <div className="settings-title-lockup">
             <span><Brain size={16} /></span>
             <div>
-              <h2 id="model-settings-title">模型设置</h2>
-              <p>小宫大脑连接</p>
+              <h2 id="model-settings-title">{t('settings.title')}</h2>
+              <p>{t('settings.subtitle')}</p>
             </div>
           </div>
-          <button type="button" onClick={onCancel} aria-label="关闭设置">
+          <button type="button" onClick={onCancel} aria-label={t('actions.close')}>
             <X size={16} />
           </button>
         </div>
 
         <div className={`settings-status ${configured ? 'ready' : 'empty'}`}>
           <div>
-            <strong>{configured ? '已配置 API Key' : '等待配置 API Key'}</strong>
-            <span>{configured ? `${value.model || '未选择模型'} · ${value.baseUrl || '未设置地址'}` : '保存后，小宫审片和语义分析会使用这里的模型服务。'}</span>
+            <strong>{configured ? t('settings.configured') : t('settings.waiting')}</strong>
+            <span>{configured ? t('settings.configuredDetail', { model: value.model || '-', baseUrl: value.baseUrl || '-' }) : t('settings.waitingDetail')}</span>
           </div>
-          <em>{configured ? 'Ready' : 'Setup'}</em>
+          <em>{configured ? t('settings.ready') : t('settings.setup')}</em>
         </div>
 
         <div className="settings-fields">
           <label className="settings-field">
-            <span><Server size={14} /> 服务地址</span>
+            <span><Server size={14} /> {t('settings.baseUrl')}</span>
             <div>
               <input
                 value={value.baseUrl}
@@ -1297,13 +1301,26 @@ function ModelSettingsDialog({
           </label>
 
           <label className="settings-field">
-            <span><SlidersHorizontal size={14} /> 模型</span>
+            <span><SlidersHorizontal size={14} /> {t('settings.model')}</span>
             <div>
               <input
                 value={value.model}
                 placeholder="gpt-5.5"
                 onChange={(event) => onChange({ ...value, model: event.target.value })}
               />
+            </div>
+          </label>
+
+          <label className="settings-field">
+            <span><SlidersHorizontal size={14} /> {t('settings.language')}</span>
+            <div>
+              <select
+                value={normalizeLanguage(value.language)}
+                onChange={(event) => onChange({ ...value, language: normalizeLanguage(event.target.value) })}
+              >
+                <option value="zh-CN">{t('app.languageChinese')}</option>
+                <option value="en-US">{t('app.languageEnglish')}</option>
+              </select>
             </div>
           </label>
 
@@ -1322,10 +1339,10 @@ function ModelSettingsDialog({
         </div>
 
         <div className="settings-dialog-actions">
-          <button type="button" onClick={onCancel}>取消</button>
+          <button type="button" onClick={onCancel}>{t('actions.cancel')}</button>
           <button type="button" className="primary" onClick={onSave} disabled={!canSave || saving}>
             {saving ? <Loader2 className="spin" size={14} /> : <Check size={14} />}
-            保存
+            {t('actions.save')}
           </button>
         </div>
       </section>
@@ -1403,7 +1420,8 @@ function EmptyState({
   onImportArchive,
   onOpenBatch,
   onRemoveBatch,
-  disabled
+  disabled,
+  t
 }: {
   batches: Array<{ id: string; name: string; status: string; totalPhotos: number; createdAt: string }>;
   onImportFolder: () => void;
@@ -1411,36 +1429,37 @@ function EmptyState({
   onOpenBatch: (batchId: string) => void | Promise<void>;
   onRemoveBatch: (batchId: string, name: string) => void | Promise<void>;
   disabled: boolean;
+  t: Translator;
 }): React.ReactElement {
   return (
     <div className="empty studio-empty">
       <section className="studio-hero">
         <div className="hero-copy">
-          <span className="frame-kicker">光影入席，取舍有据</span>
-          <h2>拣尽寒枝，留住一瞬光</h2>
-          <p>SenseFrame 先用本机分析把整批照片按重复、眼神、主体和技术风险分层，再由小宫理解画面语义与审美取舍，直接生成可确认的精选、保留和复核结果。</p>
+          <span className="frame-kicker">{t('home.kicker')}</span>
+          <h2>{t('home.title')}</h2>
+          <p>{t('home.body')}</p>
           <div className="hero-actions">
-            <button className="import-button" onClick={onImportFolder} disabled={disabled}><FolderOpen size={18} /> 导入文件夹</button>
+            <button className="import-button" onClick={onImportFolder} disabled={disabled}><FolderOpen size={18} /> {t('actions.importFolder')}</button>
             <button className="archive-button" onClick={onImportArchive} disabled={disabled}>RAR</button>
           </div>
           {batches.length > 0 && (
             <div className="home-batches">
               <div className="home-batches-head">
-                <span>最近批次</span>
+                <span>{t('home.recentBatches')}</span>
                 <em>{batches.length}</em>
               </div>
               <div className="home-batch-list">
                 {batches.slice(0, 4).map((item, index) => (
                   <div key={item.id} className="home-batch-item">
                     <button onClick={() => onOpenBatch(item.id)}>
-                      <strong>批次 {String(index + 1).padStart(2, '0')}</strong>
+                      <strong>{t('sidebar.batch', { index: String(index + 1).padStart(2, '0') })}</strong>
                       <span>{item.name}</span>
                     </button>
                     <em>{item.totalPhotos}</em>
                     <button
                       className="home-batch-delete"
-                      title="删除批次"
-                      aria-label={`删除批次 ${item.name}`}
+                      title={t('actions.deleteBatch')}
+                      aria-label={`${t('actions.deleteBatch')} ${item.name}`}
                       onClick={() => onRemoveBatch(item.id, item.name)}
                     >
                       <Trash2 size={14} />
@@ -1465,35 +1484,35 @@ function EmptyState({
       <section className="readiness-grid studio-readiness">
         <div className="readiness-card">
           <ImageIcon size={20} />
-          <span>导入预览</span>
+          <span>{t('home.cards.importPreview')}</span>
         </div>
         <div className="readiness-card">
           <Eye size={20} />
-          <span>风险识别</span>
+          <span>{t('home.cards.risk')}</span>
         </div>
         <div className="readiness-card">
           <Aperture size={20} />
-          <span>相似分组</span>
+          <span>{t('home.cards.grouping')}</span>
         </div>
         <div className="readiness-card">
           <Sparkles size={20} />
-          <span>小宫审片</span>
+          <span>{t('home.cards.xiaogong')}</span>
         </div>
       </section>
     </div>
   );
 }
 
-function ImportOverlay({ progress }: { progress: ImportProgress }): React.ReactElement {
+function ImportOverlay({ progress, t }: { progress: ImportProgress; t: Translator }): React.ReactElement {
   const hasTotal = typeof progress.total === 'number' && progress.total > 0;
   const value = hasTotal ? Math.min(100, Math.round(((progress.current || 0) / progress.total!) * 100)) : undefined;
   const stageLabel: Record<ImportProgress['stage'], string> = {
-    extracting: '解压',
-    scanning: '扫描',
-    analyzing: '分析',
-    clustering: '成组',
-    done: '完成',
-    error: '错误'
+    extracting: t('import.stageExtracting'),
+    scanning: t('import.stageScanning'),
+    analyzing: t('import.stageAnalyzing'),
+    clustering: t('import.stageClustering'),
+    done: t('import.stageDone'),
+    error: t('import.stageError')
   };
   return (
     <div className="import-overlay" role="status" aria-live="polite">
@@ -1506,7 +1525,7 @@ function ImportOverlay({ progress }: { progress: ImportProgress }): React.ReactE
         <div className="progress-track">
           <i style={{ width: hasTotal ? `${value}%` : '38%' }} />
         </div>
-        <small>{hasTotal ? `${progress.current || 0} / ${progress.total} · ${value}%` : '请稍候...'}</small>
+        <small>{hasTotal ? `${progress.current || 0} / ${progress.total} · ${value}%` : t('import.waiting')}</small>
       </div>
     </div>
   );
@@ -1516,33 +1535,35 @@ function PhotoPanel({
   photo,
   onDecide,
   onApplyBrainSuggestion,
-  onRejectBrainSuggestion
+  onRejectBrainSuggestion,
+  t
 }: {
   photo?: PhotoView;
   onDecide: (decision: Decision, rating?: number) => void;
   onApplyBrainSuggestion: (review: BrainPhotoReview) => void;
   onRejectBrainSuggestion: (review: BrainPhotoReview) => void;
+  t: Translator;
 }): React.ReactElement {
-  if (!photo) return <div className="panel empty-panel">没有可显示的照片</div>;
-  const eyeStateLabel = eyeStateText(photo.analysis?.eyeState);
+  if (!photo) return <div className="panel empty-panel">{t('photo.noPhotos')}</div>;
+  const eyeStateLabel = eyeStateText(photo.analysis?.eyeState, t);
   return (
     <div className="panel">
       <div className="photo-title">
         <div>
           <h2>{photo.fileName}</h2>
-          <p>{photo.cameraModel || 'Unknown camera'} · ISO {photo.iso || '-'} · f/{photo.aperture || '-'}</p>
+          <p>{photo.cameraModel || t('photo.unknownCamera')} · ISO {photo.iso || '-'} · f/{photo.aperture || '-'}</p>
         </div>
-        <span className={`decision ${photo.decision}`}>{decisionLabel(photo.decision)}</span>
+        <span className={`decision ${photo.decision}`}>{decisionLabel(photo.decision, t)}</span>
       </div>
 
       <div className="decision-dock">
         <div className="actions">
-          <button className={photo.decision === 'pick' ? 'selected pick-action' : 'pick-action'} onClick={() => onDecide('pick')} title="保留"><Check size={16} /><span>保留</span></button>
-          <button className={photo.decision === 'maybe' ? 'selected maybe-action' : 'maybe-action'} onClick={() => onDecide('maybe')} title="待定"><Eye size={16} /><span>待定</span></button>
-          <button className={photo.decision === 'reject' ? 'selected reject-action' : 'reject-action'} onClick={() => onDecide('reject')} title="淘汰"><X size={16} /><span>淘汰</span></button>
+          <button className={photo.decision === 'pick' ? 'selected pick-action' : 'pick-action'} onClick={() => onDecide('pick')} title={t('actions.keep')}><Check size={16} /><span>{t('actions.keep')}</span></button>
+          <button className={photo.decision === 'maybe' ? 'selected maybe-action' : 'maybe-action'} onClick={() => onDecide('maybe')} title={t('actions.maybe')}><Eye size={16} /><span>{t('actions.maybe')}</span></button>
+          <button className={photo.decision === 'reject' ? 'selected reject-action' : 'reject-action'} onClick={() => onDecide('reject')} title={t('actions.reject')}><X size={16} /><span>{t('actions.reject')}</span></button>
         </div>
 
-        <div className="rating-row" aria-label="星级">
+        <div className="rating-row" aria-label={t('photo.rating')}>
           {[1, 2, 3, 4, 5].map((star) => (
             <button key={star} onClick={() => onDecide('pick', star)} className={photo.rating && photo.rating >= star ? 'lit' : ''}><Star size={16} /></button>
           ))}
@@ -1550,14 +1571,14 @@ function PhotoPanel({
       </div>
 
       <div className="score-grid">
-        <Score label="清晰" value={photo.analysis?.sharpnessScore} />
-        <Score label="曝光" value={photo.analysis?.exposureScore} />
-        <Score label="人脸" value={photo.analysis?.faceScore} />
-        <Score label="眼部" value={photo.analysis?.eyeConfidence} display={eyeStateLabel} />
+        <Score label={t('photo.scoreSharp')} value={photo.analysis?.sharpnessScore} />
+        <Score label={t('photo.scoreExposure')} value={photo.analysis?.exposureScore} />
+        <Score label={t('photo.scoreFace')} value={photo.analysis?.faceScore} />
+        <Score label={t('photo.scoreEye')} value={photo.analysis?.eyeConfidence} display={eyeStateLabel} />
       </div>
 
       <div className="risk-row">
-        {(photo.analysis?.riskFlags || []).length ? photo.analysis?.riskFlags.map((flag) => <span key={flag}>{riskLabel(flag)}</span>) : <span>无明显技术风险</span>}
+        {(photo.analysis?.riskFlags || []).length ? photo.analysis?.riskFlags.map((flag) => <span key={flag}>{riskLabel(flag, t)}</span>) : <span>{t('risk.none')}</span>}
       </div>
 
       <BrainReviewPanel
@@ -1565,6 +1586,7 @@ function PhotoPanel({
         photoDecision={photo.decision}
         onApply={onApplyBrainSuggestion}
         onReject={onRejectBrainSuggestion}
+        t={t}
       />
     </div>
   );
@@ -1578,7 +1600,8 @@ function XiaogongConsole({
   activeSmartView,
   activeItem,
   onInput,
-  onRun
+  onRun,
+  t
 }: {
   busy: string;
   input: string;
@@ -1588,19 +1611,20 @@ function XiaogongConsole({
   activeItem?: SmartView['items'][number];
   onInput: (value: string) => void;
   onRun: (message?: string) => void;
+  t: Translator;
 }): React.ReactElement {
-  const quickTasks = ['找最好看的', '找封面候选', '复核闭眼', '每组选 1 张'];
+  const quickTasks = [t('xiaogong.quickBest'), t('xiaogong.quickCover'), t('xiaogong.quickEyes'), t('xiaogong.quickGroup')];
   return (
     <section className="xiaogong-console">
       <div className="xiaogong-head">
-        <span><Brain size={15} /> 小宫</span>
-        <em>{busy ? '运行中' : activeSmartView ? '视图控制' : '待命'}</em>
+        <span><Brain size={15} /> {t('xiaogong.name')}</span>
+        <em>{busy ? t('xiaogong.running') : activeSmartView ? t('xiaogong.viewControl') : t('xiaogong.idle')}</em>
       </div>
 
       <div className="xiaogong-input-row">
         <input
           value={input}
-          placeholder="对小宫说：找出最好看的"
+          placeholder={t('xiaogong.placeholder')}
           onChange={(event) => onInput(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey) {
@@ -1610,7 +1634,7 @@ function XiaogongConsole({
           }}
           disabled={Boolean(busy)}
         />
-        <button onClick={() => onRun()} disabled={Boolean(busy || !input.trim())} title="发送">
+        <button onClick={() => onRun()} disabled={Boolean(busy || !input.trim())} title={t('actions.send')}>
           {busy ? <Loader2 className="spin" size={14} /> : <Send size={14} />}
         </button>
       </div>
@@ -1621,7 +1645,7 @@ function XiaogongConsole({
         ))}
       </div>
 
-      <XiaogongLogTimeline activity={activity} active={Boolean(busy)} />
+      <XiaogongLogTimeline activity={activity} active={Boolean(busy)} t={t} />
 
       {result?.confirmation && (
         <div className="xiaogong-confirmation">
@@ -1629,7 +1653,7 @@ function XiaogongConsole({
           <p>{result.confirmation.message}</p>
           <span>{result.confirmation.permissionLevel}</span>
           <div>
-            <button type="button" disabled>等待确认功能接入</button>
+            <button type="button" disabled>{t('xiaogong.confirmationTodo')}</button>
           </div>
         </div>
       )}
@@ -1637,7 +1661,7 @@ function XiaogongConsole({
   );
 }
 
-function XiaogongLogTimeline({ activity, active }: { activity: BrainUiLogEvent[]; active: boolean }): React.ReactElement | null {
+function XiaogongLogTimeline({ activity, active, t }: { activity: BrainUiLogEvent[]; active: boolean; t: Translator }): React.ReactElement | null {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const [followTail, setFollowTail] = useState(true);
   const hasActivity = activity.length > 0;
@@ -1653,8 +1677,8 @@ function XiaogongLogTimeline({ activity, active }: { activity: BrainUiLogEvent[]
   return (
     <div className="xiaogong-log">
       <div className="xiaogong-log-head">
-        <span>任务日志</span>
-        <em>{active ? '运行中' : hasActivity ? '已记录' : '等待事件'}</em>
+        <span>{t('xiaogong.logs')}</span>
+        <em>{active ? t('xiaogong.running') : hasActivity ? t('xiaogong.recorded') : t('xiaogong.waitingEvent')}</em>
       </div>
       <div
         className="xiaogong-log-list"
@@ -1670,11 +1694,11 @@ function XiaogongLogTimeline({ activity, active }: { activity: BrainUiLogEvent[]
             key={item.id}
             className={`xiaogong-log-item ${item.level}`}
             type="button"
-            title={item.photoFileName || xiaogongDisplayTitle(item)}
+            title={item.photoFileName || xiaogongDisplayTitle(item, t)}
           >
-            <span>{xiaogongPhaseLabel(item.phase)}</span>
+            <span>{xiaogongPhaseLabel(item.phase, t)}</span>
             <div>
-              <strong>{xiaogongDisplayTitle(item)}</strong>
+              <strong>{xiaogongDisplayTitle(item, t)}</strong>
               {item.message && <p>{item.message}</p>}
               {item.progress && item.progress.total > 0 && <em>{item.progress.current}/{item.progress.total}</em>}
             </div>
@@ -1693,73 +1717,44 @@ function XiaogongLogTimeline({ activity, active }: { activity: BrainUiLogEvent[]
             });
           }}
         >
-          有新进展
+          {t('xiaogong.newProgress')}
         </button>
       )}
     </div>
   );
 }
 
-function xiaogongToolTitle(toolName?: string): string | undefined {
+function xiaogongToolTitle(toolName: string | undefined, t: Translator): string | undefined {
   if (!toolName) return undefined;
-  const titles: Record<string, string> = {
-    GetWorkspaceContext: '读取工作台状态',
-    GetBatchOverview: '理解整批照片',
-    DecideReviewStrategy: '制定审片策略',
-    GetCurrentPhoto: '读取当前照片',
-    GenerateLocalCandidates: '整理候选线索',
-    CreateSmartView: '生成智能视图',
-    ShowSmartView: '打开智能视图',
-    ReviewPhotoWithVision: '查看照片画面',
-    CompareSimilarGroupWithVision: '比较连拍组',
-    WriteBrainReviewResult: '写入小宫审片结果',
-    ExplainCurrentPhoto: '解释当前照片',
-    ApplyDecision: '准备修改照片选择',
-    BatchApplyDecisions: '准备批量修改选择',
-    SetRating: '准备修改星级',
-    ExportSelected: '准备导出已选照片',
-    DeleteBatch: '准备删除批次',
-    DeleteOriginalFiles: '准备删除原片'
-  };
-  return titles[toolName];
+  const title = t(`toolTitles.${toolName}`);
+  return title === `toolTitles.${toolName}` ? undefined : title;
 }
 
-function xiaogongDisplayTitle(item: BrainUiLogEvent): string {
-  const toolTitle = xiaogongToolTitle(item.toolName);
+function xiaogongDisplayTitle(item: BrainUiLogEvent, t: Translator): string {
+  const toolTitle = xiaogongToolTitle(item.toolName, t);
   if (!toolTitle) return item.title;
-  if (item.title.startsWith('工具失败')) return `${toolTitle}失败`;
-  if (item.title.startsWith('需要确认')) return `需要确认：${toolTitle}`;
+  if (item.title.startsWith('工具失败')) return t('phases.failed') === '错误' ? `${toolTitle}失败` : `${toolTitle} failed`;
+  if (item.title.startsWith('需要确认')) return t('phases.confirmation') === '确认' ? `需要确认：${toolTitle}` : `Confirm: ${toolTitle}`;
   if (item.title.startsWith('调用工具')) return toolTitle;
   return item.title.includes(item.toolName || '') ? item.title.replace(item.toolName || '', toolTitle).replace('调用工具：', '') : item.title;
 }
 
-function xiaogongPhaseLabel(phase: BrainUiLogEvent['phase']): string {
-  const labels: Record<BrainUiLogEvent['phase'], string> = {
-    understanding: '理解',
-    workspace: '读取',
-    planning: '规划',
-    tool: '工具',
-    vision: '看图',
-    compare: '比较',
-    write: '写入',
-    ui: '界面',
-    confirmation: '确认',
-    done: '完成',
-    failed: '错误'
-  };
-  return labels[phase];
+function xiaogongPhaseLabel(phase: BrainUiLogEvent['phase'], t: Translator): string {
+  return t(`phases.${phase}`);
 }
 
 function BrainActivityPanel({
   progress,
   activity,
   active,
-  lastRun
+  lastRun,
+  t
 }: {
   progress: BrainProgressEvent | null;
   activity: BrainProgressEvent[];
   active: boolean;
   lastRun: BrainRunResult | null;
+  t: Translator;
 }): React.ReactElement | null {
   if (!active && !progress && !lastRun) return null;
   const status = progress?.status || lastRun?.status || 'running';
@@ -1767,16 +1762,16 @@ function BrainActivityPanel({
   const current = !active && lastRun ? lastRun.reviewed : progress?.current ?? lastRun?.reviewed ?? 0;
   const pctValue = total ? Math.min(100, Math.round((current / total) * 100)) : 0;
   const recentActivity = (activity.length ? activity : progress ? [progress] : []).slice(0, 3);
-  const statusLabel = active ? '审片中' : status === 'completed' ? '上次审片' : status === 'failed' ? '审片失败' : '审片状态';
+  const statusLabel = active ? t('brain.reviewing') : status === 'completed' ? t('brain.lastReview') : status === 'failed' ? t('brain.failed') : t('brain.status');
   const statusMeta = total
     ? `${current}/${total}`
     : status === 'completed'
-      ? '完成'
+      ? t('brain.completed')
       : status === 'failed'
-        ? '失败'
+        ? t('brain.failedMeta')
         : active
-          ? '进行中'
-          : '待开始';
+          ? t('brain.running')
+          : t('brain.pending');
 
   return (
     <section className={`brain-activity-panel ${status}`}>
@@ -1787,121 +1782,103 @@ function BrainActivityPanel({
       <div className="brain-activity-track">
         <i style={{ width: `${pctValue}%` }} />
       </div>
-      <strong>{progress?.message || lastRun?.message || '小宫会把当前分组的单张判断写入右侧。'}</strong>
+      <strong>{productReviewText(progress?.message || lastRun?.message || t('brain.defaultMessage'), t)}</strong>
       {active && recentActivity.length > 0 && (
         <div className="brain-activity-list">
           {recentActivity.map((item, index) => (
             <div key={`${item.phase}-${item.photoId || item.runId}-${index}`}>
-              <span>{activityLabel(item.phase)}</span>
-              <p>{item.message}</p>
+              <span>{activityLabel(item.phase, t)}</span>
+              <p>{productReviewText(item.message, t)}</p>
             </div>
           ))}
         </div>
       )}
       {status === 'failed' && (progress?.debugLogPath || lastRun?.debugLogPath) && (
-        <small>日志：{progress?.debugLogPath || lastRun?.debugLogPath}</small>
+        <small>{t('brain.log', { path: progress?.debugLogPath || lastRun?.debugLogPath })}</small>
       )}
     </section>
   );
 }
 
-function activityLabel(phase: BrainProgressEvent['phase']): string {
+function activityLabel(phase: BrainProgressEvent['phase'], t: Translator): string {
   const labels: Record<BrainProgressEvent['phase'], string> = {
-    started: '开始',
-    context: '读取',
-    planning: '规划',
-    photo_started: '看图',
-    photo_completed: '完成',
-    group_started: '比较',
-    group_completed: '组内',
-    reducing: '归并',
-    persisting: '写入',
-    completed: '结束',
-    failed: '错误'
+    started: t('phases.understanding'),
+    context: t('phases.workspace'),
+    planning: t('phases.planning'),
+    photo_started: t('phases.vision'),
+    photo_completed: t('phases.done'),
+    group_started: t('phases.compare'),
+    group_completed: t('phases.compare'),
+    reducing: t('phases.planning'),
+    persisting: t('phases.write'),
+    completed: t('phases.done'),
+    failed: t('phases.failed')
   };
   return labels[phase];
 }
 
-function bucketText(bucket?: string): string {
-  const labels: Record<string, string> = {
-    featured: '精选候选',
-    keepers: '建议保留',
-    lowPriority: '低优先级备选',
-    reviewQueue: '人工复核',
-    closedEyes: '疑似闭眼',
-    eyeReview: '眼部复核',
-    subject: '主体问题',
-    technical: '技术问题',
-    duplicates: '近重复',
-    similarBursts: '相似连拍',
-    pending: '待判断'
-  };
-  return labels[bucket || ''] || '未分组';
+function bucketText(bucket: string | undefined, t: Translator): string {
+  const label = t(`buckets.${bucket || 'unknown'}`);
+  return label === `buckets.${bucket || 'unknown'}` ? t('buckets.unknown') : label;
 }
 
-function actionText(action?: string): string {
-  const labels: Record<string, string> = {
-    pick: '建议保留',
-    reject: '建议淘汰',
-    maybe: '建议保留',
-    review: '建议人工复核',
-    none: '不改人工标记'
-  };
-  return labels[action || ''] || '建议人工复核';
+function actionText(action: string | undefined, t: Translator): string {
+  const label = t(`actionText.${action || 'fallback'}`);
+  return label === `actionText.${action || 'fallback'}` ? t('actionText.fallback') : label;
 }
 
-function productReviewText(value?: string): string {
+function productReviewText(value: string | undefined, t: Translator): string {
   if (!value) return '';
   return value
-    .replace(/\bcell\s*#?\s*\d+\b/gi, '同组相邻照片')
-    .replace(/\bfeatured\b/gi, '精选候选')
-    .replace(/\bkeeper(s)?\b/gi, '保留备选')
-    .replace(/\bmaybe\b/gi, '备选保留')
-    .replace(/\breject\b/gi, '淘汰')
-    .replace(/\bpick\b/gi, '保留')
-    .replace(/\bprimaryBucket\b/g, '主分组')
-    .replace(/\bsecondaryBuckets\b/g, '辅助分组')
-    .replace(/\brecommendedAction\b/g, '建议动作')
-    .replace(/\bneedsHumanReview\b/g, '人工复核')
-    .replace(/\bsimilarBursts\b/g, '相似连拍')
-    .replace(/\bclosedEyes\b/g, '闭眼风险')
-    .replace(/\beyeReview\b/g, '眼神复核')
-    .replace(/\bface[_ ]?blur\b/gi, '脸部清晰度风险')
-    .replace(/\bface[_ ]?missing\b/gi, '主体缺失风险')
-    .replace(/\blocal\b/gi, '自动')
+    .replace(/\bcell\s*#?\s*\d+\b/gi, t('productText.nearby'))
+    .replace(/\bfeatured\b/gi, t('productText.featured'))
+    .replace(/\bkeeper(s)?\b/gi, t('productText.keeper'))
+    .replace(/\bmaybe\b/gi, t('productText.maybe'))
+    .replace(/\breject\b/gi, t('productText.reject'))
+    .replace(/\bpick\b/gi, t('productText.pick'))
+    .replace(/\bprimaryBucket\b/g, t('productText.primaryBucket'))
+    .replace(/\bsecondaryBuckets\b/g, t('productText.secondaryBuckets'))
+    .replace(/\brecommendedAction\b/g, t('productText.recommendedAction'))
+    .replace(/\bneedsHumanReview\b/g, t('productText.needsHumanReview'))
+    .replace(/\bsimilarBursts\b/g, t('productText.similarBursts'))
+    .replace(/\bclosedEyes\b/g, t('productText.closedEyes'))
+    .replace(/\beyeReview\b/g, t('productText.eyeReview'))
+    .replace(/\bface[_ ]?blur\b/gi, t('productText.faceBlur'))
+    .replace(/\bface[_ ]?missing\b/gi, t('productText.faceMissing'))
+    .replace(/\blocal\b/gi, t('productText.local'))
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-function smallModelOverrideText(value: string): string {
+function smallModelOverrideText(value: string, t: Translator): string {
   const text = value.trim();
   const lower = text.toLowerCase();
   const mappings: Array<[RegExp, string]> = [
-    [/local[_ ]?score|final[_ ]?score|score.*overstates|overestimate|overstates|overstated|does not reflect|偏高|高分.*下调/i, '自动评分偏高'],
-    [/^score$|score/i, '自动评分需复核'],
-    [/exposure[_ ]?score|exposure/i, '曝光判断需复核'],
-    [/face[_ ]?score/i, '人像清晰度需复核'],
-    [/featured value|cover-level|not featured|featured/i, '未达精选门槛'],
-    [/background clutter|busy background|background.*clutter/i, '背景干扰明显'],
-    [/average lighting|harsh backlight|backlight|lighting/i, '光线影响质感'],
-    [/deliverablescore|deliverable score/i, '交付完成度不足'],
-    [/face_blur|face blur|missed_focus|focus/i, '脸部清晰度风险'],
-    [/eyes_uncertain|eye/i, '眼神需要复核'],
-    [/face_missing|back view/i, '主体表达偏弱'],
-    [/snapshot|low finish|finish/i, '画面完成度偏随拍'],
-    [/crop|cropped/i, '裁切不够理想']
+    [/local[_ ]?score|final[_ ]?score|score.*overstates|overestimate|overstates|overstated|does not reflect|偏高|高分.*下调/i, t('override.scoreHigh')],
+    [/^score$|score/i, t('override.scoreReview')],
+    [/exposure[_ ]?score|exposure/i, t('override.exposureReview')],
+    [/face[_ ]?score/i, t('override.faceReview')],
+    [/featured value|cover-level|not featured|featured/i, t('override.notFeatured')],
+    [/background clutter|busy background|background.*clutter/i, t('override.background')],
+    [/average lighting|harsh backlight|backlight|lighting/i, t('override.lighting')],
+    [/deliverablescore|deliverable score/i, t('override.deliverable')],
+    [/face_blur|face blur|missed_focus|focus/i, t('override.faceBlur')],
+    [/eyes_uncertain|eye/i, t('override.eyes')],
+    [/face_missing|back view/i, t('override.subject')],
+    [/snapshot|low finish|finish/i, t('override.finish')],
+    [/crop|cropped/i, t('override.crop')]
   ];
   const hit = mappings.find(([pattern]) => pattern.test(lower));
   if (hit) return hit[1];
-  if (lower === '[object object]' || lower.includes('[object object]')) return '修正依据需复核';
+  if (lower === '[object object]' || lower.includes('[object object]')) return t('override.structured');
   const asciiChars = text.match(/[a-z0-9_()[\].:-]/gi)?.length || 0;
   const visibleChars = text.replace(/\s/g, '').length || 1;
-  if (asciiChars / visibleChars > 0.6) return '自动判断需复核';
+  if (asciiChars / visibleChars > 0.6) return t('override.fallback');
   return text.length > 18 ? `${text.slice(0, 18)}...` : text;
 }
 
-function smallModelOverrideTitle(value: string): string {
-  const display = smallModelOverrideText(value);
+function smallModelOverrideTitle(value: string, t: Translator): string {
+  const display = smallModelOverrideText(value, t);
   const text = value.trim();
   const asciiChars = text.match(/[a-z0-9_()[\].:-]/gi)?.length || 0;
   const visibleChars = text.replace(/\s/g, '').length || 1;
@@ -1928,12 +1905,14 @@ function BrainReviewPanel({
   review,
   photoDecision,
   onApply,
-  onReject
+  onReject,
+  t
 }: {
   review?: BrainPhotoReview;
   photoDecision: Decision;
   onApply: (review: BrainPhotoReview) => void;
   onReject: (review: BrainPhotoReview, note?: string) => void;
+  t: Translator;
 }): React.ReactElement {
   const [rejecting, setRejecting] = React.useState(false);
   const [rejectNote, setRejectNote] = React.useState('');
@@ -1942,63 +1921,63 @@ function BrainReviewPanel({
     return (
       <section className="brain-review-panel empty-brain-review">
         <div className="brain-review-head">
-          <span><Brain size={15} /> 小宫判断</span>
-          <em>尚未审片</em>
+          <span><Brain size={15} /> {t('xiaogong.judgment')}</span>
+          <em>{t('xiaogong.noReviewYet')}</em>
         </div>
-        <p>运行“小宫审片”后，这里只保留当前照片的结论和关键证据。</p>
+        <p>{t('xiaogong.emptyReview')}</p>
       </section>
     );
   }
 
   const scores = [
-    ['画面', review.visualScores.visualQuality],
-    ['表情', review.visualScores.expression],
-    ['瞬间', review.visualScores.moment],
-    ['构图', review.visualScores.composition],
-    ['背景', review.visualScores.backgroundCleanliness],
-    ['故事', review.visualScores.storyValue]
+    [t('reviewScores.visual'), review.visualScores.visualQuality],
+    [t('reviewScores.expression'), review.visualScores.expression],
+    [t('reviewScores.moment'), review.visualScores.moment],
+    [t('reviewScores.composition'), review.visualScores.composition],
+    [t('reviewScores.background'), review.visualScores.backgroundCleanliness],
+    [t('reviewScores.story'), review.visualScores.storyValue]
   ] as const;
   const recommendedDecision: Decision | undefined =
     review.recommendedAction === 'pick' || review.recommendedAction === 'reject' || review.recommendedAction === 'maybe'
       ? review.recommendedAction
       : undefined;
   const accepted = Boolean(recommendedDecision && photoDecision === recommendedDecision);
-  const decisionText = recommendedDecision ? decisionLabel(recommendedDecision) : '';
+  const decisionText = recommendedDecision ? decisionLabel(recommendedDecision, t) : '';
   const deliverableScore = review.visualScores.deliverableScore;
   const curationScore = reviewCurationScore(review);
-  const reasonText = productReviewText(review.reason);
-  const groupReasonText = productReviewText(review.groupReason);
+  const reasonText = productReviewText(review.reason, t);
+  const groupReasonText = productReviewText(review.groupReason, t);
 
   return (
     <section className="brain-review-panel">
       <div className="brain-review-head">
-        <span><Brain size={15} /> 小宫判断</span>
-        <em title="这是小宫对当前判断的置信度，不是审美排序分。">判断置信度 {scorePct(review.confidence)}%</em>
+        <span><Brain size={15} /> {t('xiaogong.judgment')}</span>
+        <em title={t('xiaogong.confidenceTitle')}>{t('xiaogong.confidence', { value: scorePct(review.confidence) })}</em>
       </div>
       <div className="brain-score-summary">
-        <div title="照片作为交付/展示候选的完成度。">
-          <span>交付分</span>
+        <div title={t('xiaogong.deliveryTitle')}>
+          <span>{t('xiaogong.deliveryScore')}</span>
           <strong>{scorePct(deliverableScore)}</strong>
         </div>
-        <div title="由画面、表情、瞬间、构图、背景和故事综合得到的参考分。">
-          <span>综合参考</span>
+        <div title={t('xiaogong.referenceTitle')}>
+          <span>{t('xiaogong.referenceScore')}</span>
           <strong>{scorePct(curationScore)}</strong>
         </div>
       </div>
       <div className="brain-bucket-line">
-        <strong>{bucketText(review.primaryBucket)}</strong>
+        <strong>{bucketText(review.primaryBucket, t)}</strong>
         <span className={`brain-action-chip ${accepted ? 'accepted' : review.recommendedAction || 'review'}`}>
-          {accepted ? `已采纳：${decisionText}` : actionText(review.recommendedAction)}
+          {accepted ? t('xiaogong.accepted', { decision: decisionText }) : actionText(review.recommendedAction, t)}
         </span>
       </div>
       <p className="brain-reason" title={reasonText}>{reasonText}</p>
       {review.smallModelOverrides.length > 0 && (
         <div className="brain-overrides">
-          <strong>小宫修正</strong>
-          {review.smallModelOverrides.map((item) => <span key={item} title={smallModelOverrideTitle(item)}>{smallModelOverrideText(item)}</span>)}
+          <strong>{t('xiaogong.correction')}</strong>
+          {review.smallModelOverrides.map((item) => <span key={item} title={smallModelOverrideTitle(item, t)}>{smallModelOverrideText(item, t)}</span>)}
         </div>
       )}
-      {review.needsHumanReview && <div className="brain-review-alert">需要人工复核</div>}
+      {review.needsHumanReview && <div className="brain-review-alert">{t('xiaogong.humanReview')}</div>}
       <div className="brain-score-grid">
         {scores.map(([label, value]) => (
           <div key={label}>
@@ -2010,32 +1989,32 @@ function BrainReviewPanel({
       {groupReasonText && <p className="brain-group-reason" title={groupReasonText}>{groupReasonText}</p>}
       <div className="brain-review-actions">
         {accepted ? (
-          <div className="brain-review-accepted"><Check size={14} /> 已按小宫判断更新当前照片状态</div>
+          <div className="brain-review-accepted"><Check size={14} /> {t('xiaogong.updated')}</div>
         ) : (
           rejecting ? (
             <div className="brain-reject-box">
               <textarea
                 value={rejectNote}
                 onChange={(event) => setRejectNote(event.target.value)}
-                placeholder="填写不采纳理由，例如：人物表情更自然、构图更完整、闭眼其实是情绪瞬间"
+                placeholder={t('xiaogong.rejectPlaceholder')}
                 rows={3}
               />
               <div className="brain-reject-actions">
                 <button onClick={() => { onReject(review, rejectNote); setRejecting(false); setRejectNote(''); }}>
-                  <X size={14} /> 确认不采纳
+                  <X size={14} /> {t('actions.confirmReject')}
                 </button>
                 <button onClick={() => { setRejecting(false); setRejectNote(''); }}>
-                  取消
+                  {t('actions.cancel')}
                 </button>
               </div>
             </div>
           ) : (
             <>
               <button onClick={() => onApply(review)} disabled={review.recommendedAction === 'none'}>
-                <Check size={14} /> 采纳
+                <Check size={14} /> {t('actions.accept')}
               </button>
               <button onClick={() => setRejecting(true)}>
-                <X size={14} /> 不采纳
+                <X size={14} /> {t('actions.rejectSuggestion')}
               </button>
             </>
           )
@@ -2045,15 +2024,9 @@ function BrainReviewPanel({
   );
 }
 
-function eyeStateText(state?: string): string {
-  const labels: Record<string, string> = {
-    open: '睁眼',
-    closed: '闭眼',
-    uncertain: '不确定',
-    not_applicable: '不适用',
-    unknown: '未知'
-  };
-  return labels[state || 'unknown'] || '未知';
+function eyeStateText(state: string | undefined, t: Translator): string {
+  const label = t(`eyeState.${state || 'unknown'}`);
+  return label === `eyeState.${state || 'unknown'}` ? t('eyeState.unknown') : label;
 }
 
 function Score({ label, value, display }: { label: string; value?: number; display?: string }): React.ReactElement {

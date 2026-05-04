@@ -1,5 +1,7 @@
 export type Decision = 'none' | 'pick' | 'reject' | 'maybe';
 
+export type AppLanguage = 'zh-CN' | 'en-US';
+
 export type BatchStatus = 'idle' | 'scanning' | 'processing' | 'ready' | 'failed';
 
 export type RiskFlag =
@@ -145,6 +147,7 @@ export type ModelSettings = {
   baseUrl: string;
   model: string;
   apiKey: string;
+  language?: AppLanguage;
 };
 
 export type ImportProgress = {
@@ -206,6 +209,7 @@ export type XiaogongRunRequest = {
   currentMode?: string;
   activePhotoId?: string;
   smartViewId?: string;
+  language?: AppLanguage;
 };
 
 export type XiaogongUiPatch = {
@@ -436,6 +440,7 @@ export type BrainRunRequest = {
   scope: BrainRunScope;
   focusMode?: string;
   activePhotoId?: string;
+  language?: AppLanguage;
 };
 
 export type BrainRunResult = {

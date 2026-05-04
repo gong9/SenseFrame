@@ -11,6 +11,7 @@ export async function runXiaogongTask(
     message: request.message,
     currentMode: request.currentMode,
     activePhotoId: request.activePhotoId,
-    smartViewId: request.smartViewId
+    smartViewId: request.smartViewId,
+    language: request.language
   }, onProgress);
 }
