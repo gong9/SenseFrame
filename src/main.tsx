@@ -45,7 +45,7 @@ import type {
 } from '../electron/shared/types';
 import './styles.css';
 
-type ViewMode = 'featured' | 'closedEyes' | 'eyeReview' | 'subject' | 'technical' | 'duplicates' | 'similarBursts' | 'pending' | 'search' | 'smartView';
+type ViewMode = 'featured' | 'keepers' | 'lowPriority' | 'reviewQueue' | 'closedEyes' | 'eyeReview' | 'subject' | 'technical' | 'duplicates' | 'similarBursts' | 'pending' | 'search' | 'smartView';
 
 function pct(value?: number): string {
   return `${Math.round((value || 0) * 100)}`;
@@ -194,6 +194,29 @@ function brainBlocksFeatured(photo: PhotoView): boolean {
   if (review.primaryBucket !== 'featured') return true;
   if (review.needsHumanReview) return true;
   return review.recommendedAction === 'reject' || review.recommendedAction === 'maybe' || review.recommendedAction === 'review';
+}
+
+function isBrainKeeper(photo: PhotoView): boolean {
+  const review = photo.brainReview;
+  if (!review || photo.decision === 'reject') return false;
+  if (review.recommendedAction === 'pick') return true;
+  if (review.recommendedAction !== 'maybe') return false;
+  if (review.needsHumanReview) return false;
+  if (review.primaryBucket === 'technical' || review.primaryBucket === 'eyeReview' || review.primaryBucket === 'pending') return false;
+  return (review.visualScores.deliverableScore ?? 0) >= 0.6;
+}
+
+function isLowPriorityKeeper(photo: PhotoView): boolean {
+  const review = photo.brainReview;
+  if (!review || photo.decision === 'reject') return false;
+  if (isBrainKeeper(photo)) return false;
+  return review.recommendedAction === 'maybe';
+}
+
+function isBrainReviewQueue(photo: PhotoView): boolean {
+  const review = photo.brainReview;
+  if (!review || photo.decision === 'reject') return false;
+  return review.recommendedAction === 'review' || review.needsHumanReview;
 }
 
 function canFeature(photo: PhotoView): boolean {
@@ -452,6 +475,9 @@ function App(): React.ReactElement {
   }, [batch, burstMeta, clusterMeta, hasBrainCuration]);
   const brainBucketCount = (bucket: ViewMode): number => {
     if (!batch || !hasBrainCuration || bucket === 'search') return 0;
+    if (bucket === 'keepers') return batch.photos.filter(isBrainKeeper).length;
+    if (bucket === 'lowPriority') return batch.photos.filter(isLowPriorityKeeper).length;
+    if (bucket === 'reviewQueue') return batch.photos.filter(isBrainReviewQueue).length;
     return batch.photos.filter((photo) => photo.brainReview?.primaryBucket === bucket).length;
   };
   const bucketDefs = useMemo(() => {
@@ -463,6 +489,27 @@ function App(): React.ReactElement {
         description: hasBrainCuration ? '大脑最终优先看的照片' : '每段优先看的照片',
         count: featuredIds.size,
         icon: <Sparkles size={16} />
+      },
+      {
+        id: 'keepers',
+        label: '建议保留',
+        description: hasBrainCuration ? '质量过线、无需复核的 keeper' : '运行小宫审片后生成',
+        count: hasBrainCuration ? brainBucketCount('keepers') : 0,
+        icon: <Check size={16} />
+      },
+      {
+        id: 'lowPriority',
+        label: '低优先级备选',
+        description: hasBrainCuration ? '有保留价值但不强' : '运行小宫审片后生成',
+        count: hasBrainCuration ? brainBucketCount('lowPriority') : 0,
+        icon: <Star size={16} />
+      },
+      {
+        id: 'reviewQueue',
+        label: '人工复核',
+        description: hasBrainCuration ? '眼神、焦点或语义需确认' : '运行小宫审片后生成',
+        count: hasBrainCuration ? brainBucketCount('reviewQueue') : 0,
+        icon: <Brain size={16} />
       },
       {
         id: 'closedEyes',
@@ -530,6 +577,21 @@ function App(): React.ReactElement {
         .filter((photo): photo is PhotoView => Boolean(photo));
     }
     if (mode === 'featured') return batch.photos.filter((photo) => featuredIds.has(photo.id)).sort((a, b) => reviewScore(b) - reviewScore(a));
+    if (mode === 'keepers') {
+      return batch.photos
+        .filter(isBrainKeeper)
+        .sort((a, b) => reviewScore(b) - reviewScore(a));
+    }
+    if (mode === 'lowPriority') {
+      return batch.photos
+        .filter(isLowPriorityKeeper)
+        .sort((a, b) => reviewScore(b) - reviewScore(a));
+    }
+    if (mode === 'reviewQueue') {
+      return batch.photos
+        .filter(isBrainReviewQueue)
+        .sort((a, b) => reviewScore(b) - reviewScore(a));
+    }
     if (hasBrainCuration) return batch.photos.filter((photo) => photo.brainReview?.primaryBucket === mode);
     if (mode === 'closedEyes') return batch.photos.filter((photo) => hasAnyFlag(photo, closedEyeFlags));
     if (mode === 'eyeReview') return batch.photos.filter((photo) => hasAnyFlag(photo, eyeReviewFlags));
@@ -795,8 +857,14 @@ function App(): React.ReactElement {
       });
       setLastBrainRun(result);
       await loadBatch(batch.id, { resetView: true });
-      setMode(mode === 'smartView' ? 'featured' : mode);
-      setNotice(result.status === 'completed' ? result.message : `小宫审片失败：${result.message}`);
+      const nextSmartViewId = result.uiPatch?.smartViewId || result.smartView?.id;
+      if (nextSmartViewId) {
+        setSmartViews(await window.senseframe.listSmartViews(batch.id));
+        await openSmartView(nextSmartViewId);
+      } else {
+        setMode(result.status === 'completed' ? 'keepers' : mode === 'smartView' ? 'featured' : mode);
+      }
+      setNotice(result.status === 'completed' ? result.uiPatch?.notice || result.message : `小宫审片失败：${result.message}`);
     } catch (error) {
       setNotice(`小宫审片失败：${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -828,11 +896,11 @@ function App(): React.ReactElement {
       });
       setLastXiaogongResult(result);
       setXiaogongProgress(null);
-      if (result.smartView) {
-        setSmartViews(await window.senseframe.listSmartViews(batch.id));
-      }
-      if (result.uiPatch?.smartViewId) {
-        await openSmartView(result.uiPatch.smartViewId);
+      const nextSmartViews = await window.senseframe.listSmartViews(batch.id);
+      setSmartViews(nextSmartViews);
+      const nextSmartViewId = result.uiPatch?.smartViewId || result.smartView?.id;
+      if (nextSmartViewId) {
+        await openSmartView(nextSmartViewId);
       }
       setNotice(result.uiPatch?.notice || result.message);
       setXiaogongInput('');
@@ -1000,22 +1068,19 @@ function App(): React.ReactElement {
               <button className="brain-action" onClick={runBrainReview} disabled={Boolean(brainBusy || busy)} title="小宫审片">
                 {brainBusy ? <Loader2 className="spin" size={16} /> : <Brain size={16} />} 小宫
               </button>
-              <button className={debugMode ? 'selected' : ''} onClick={() => setDebugMode((value) => !value)} title="调试框">
-                <ScanFace size={16} /> 调试
-              </button>
               <button onClick={exportSelected} title="导出已选"><Download size={16} /> 导出</button>
+              <button
+                className={!modelSettings.apiKey ? 'needs-settings' : ''}
+                onClick={() => {
+                  setSettingsDraft(modelSettings);
+                  setSettingsOpen(true);
+                }}
+                title="模型设置"
+              >
+                <Settings size={16} /> 设置
+              </button>
               </>
             )}
-            <button
-              className={!modelSettings.apiKey ? 'needs-settings' : ''}
-              onClick={() => {
-                setSettingsDraft(modelSettings);
-                setSettingsOpen(true);
-              }}
-              title="模型设置"
-            >
-              <Settings size={16} /> 设置
-            </button>
           </div>
         </header>
 
@@ -1070,7 +1135,6 @@ function App(): React.ReactElement {
                 ) : (
                   <div className="missing-preview"><ImageIcon size={46} />预览不可用</div>
                 )}
-                {(busy || brainBusy) && <div className="busy"><Loader2 className="spin" size={18} /> {brainBusy || busy}</div>}
                 {activePhoto?.previewPath && (
                   <div className="zoom-controls" aria-label="图片缩放" onPointerDown={(event) => event.stopPropagation()}>
                     <button title="缩小" onClick={() => setZoom(imageZoom - 0.25)}>
@@ -1354,7 +1418,7 @@ function EmptyState({
         <div className="hero-copy">
           <span className="frame-kicker">光影入席，取舍有据</span>
           <h2>拣尽寒枝，留住一瞬光</h2>
-          <p>把整组照片铺上光桌，先看画面，再辨风险。SenseFrame 会将近重复、眼部状态、主体问题与技术缺陷整理成清醒的审片线索。</p>
+          <p>SenseFrame 先用本机分析把整批照片按重复、眼神、主体和技术风险分层，再由小宫理解画面语义与审美取舍，直接生成可确认的精选、保留和复核结果。</p>
           <div className="hero-actions">
             <button className="import-button" onClick={onImportFolder} disabled={disabled}><FolderOpen size={18} /> 导入文件夹</button>
             <button className="archive-button" onClick={onImportArchive} disabled={disabled}>RAR</button>
@@ -1401,19 +1465,19 @@ function EmptyState({
       <section className="readiness-grid studio-readiness">
         <div className="readiness-card">
           <ImageIcon size={20} />
-          <span>显影</span>
+          <span>导入预览</span>
         </div>
         <div className="readiness-card">
           <Eye size={20} />
-          <span>凝视</span>
+          <span>风险识别</span>
         </div>
         <div className="readiness-card">
           <Aperture size={20} />
-          <span>成组</span>
+          <span>相似分组</span>
         </div>
         <div className="readiness-card">
           <Sparkles size={20} />
-          <span>注解</span>
+          <span>小宫审片</span>
         </div>
       </section>
     </div>
@@ -1761,6 +1825,9 @@ function activityLabel(phase: BrainProgressEvent['phase']): string {
 function bucketText(bucket?: string): string {
   const labels: Record<string, string> = {
     featured: '精选候选',
+    keepers: '建议保留',
+    lowPriority: '低优先级备选',
+    reviewQueue: '人工复核',
     closedEyes: '疑似闭眼',
     eyeReview: '眼部复核',
     subject: '主体问题',
@@ -1776,15 +1843,85 @@ function actionText(action?: string): string {
   const labels: Record<string, string> = {
     pick: '建议保留',
     reject: '建议淘汰',
-    maybe: '建议待定',
+    maybe: '建议保留',
     review: '建议人工复核',
     none: '不改人工标记'
   };
   return labels[action || ''] || '建议人工复核';
 }
 
+function productReviewText(value?: string): string {
+  if (!value) return '';
+  return value
+    .replace(/\bcell\s*#?\s*\d+\b/gi, '同组相邻照片')
+    .replace(/\bfeatured\b/gi, '精选候选')
+    .replace(/\bkeeper(s)?\b/gi, '保留备选')
+    .replace(/\bmaybe\b/gi, '备选保留')
+    .replace(/\breject\b/gi, '淘汰')
+    .replace(/\bpick\b/gi, '保留')
+    .replace(/\bprimaryBucket\b/g, '主分组')
+    .replace(/\bsecondaryBuckets\b/g, '辅助分组')
+    .replace(/\brecommendedAction\b/g, '建议动作')
+    .replace(/\bneedsHumanReview\b/g, '人工复核')
+    .replace(/\bsimilarBursts\b/g, '相似连拍')
+    .replace(/\bclosedEyes\b/g, '闭眼风险')
+    .replace(/\beyeReview\b/g, '眼神复核')
+    .replace(/\bface[_ ]?blur\b/gi, '脸部清晰度风险')
+    .replace(/\bface[_ ]?missing\b/gi, '主体缺失风险')
+    .replace(/\blocal\b/gi, '自动')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function smallModelOverrideText(value: string): string {
+  const text = value.trim();
+  const lower = text.toLowerCase();
+  const mappings: Array<[RegExp, string]> = [
+    [/local[_ ]?score|final[_ ]?score|score.*overstates|overestimate|overstates|overstated|does not reflect|偏高|高分.*下调/i, '自动评分偏高'],
+    [/^score$|score/i, '自动评分需复核'],
+    [/exposure[_ ]?score|exposure/i, '曝光判断需复核'],
+    [/face[_ ]?score/i, '人像清晰度需复核'],
+    [/featured value|cover-level|not featured|featured/i, '未达精选门槛'],
+    [/background clutter|busy background|background.*clutter/i, '背景干扰明显'],
+    [/average lighting|harsh backlight|backlight|lighting/i, '光线影响质感'],
+    [/deliverablescore|deliverable score/i, '交付完成度不足'],
+    [/face_blur|face blur|missed_focus|focus/i, '脸部清晰度风险'],
+    [/eyes_uncertain|eye/i, '眼神需要复核'],
+    [/face_missing|back view/i, '主体表达偏弱'],
+    [/snapshot|low finish|finish/i, '画面完成度偏随拍'],
+    [/crop|cropped/i, '裁切不够理想']
+  ];
+  const hit = mappings.find(([pattern]) => pattern.test(lower));
+  if (hit) return hit[1];
+  if (lower === '[object object]' || lower.includes('[object object]')) return '修正依据需复核';
+  const asciiChars = text.match(/[a-z0-9_()[\].:-]/gi)?.length || 0;
+  const visibleChars = text.replace(/\s/g, '').length || 1;
+  if (asciiChars / visibleChars > 0.6) return '自动判断需复核';
+  return text.length > 18 ? `${text.slice(0, 18)}...` : text;
+}
+
+function smallModelOverrideTitle(value: string): string {
+  const display = smallModelOverrideText(value);
+  const text = value.trim();
+  const asciiChars = text.match(/[a-z0-9_()[\].:-]/gi)?.length || 0;
+  const visibleChars = text.replace(/\s/g, '').length || 1;
+  return asciiChars / visibleChars > 0.6 ? display : text;
+}
+
 function scorePct(value?: number): string {
   return `${Math.round((value || 0) * 100)}`;
+}
+
+function reviewCurationScore(review: BrainPhotoReview): number {
+  const scores = review.visualScores;
+  return (
+    (scores.visualQuality || 0) * 0.18
+    + (scores.expression || 0) * 0.18
+    + (scores.moment || 0) * 0.18
+    + (scores.composition || 0) * 0.16
+    + (scores.backgroundCleanliness || 0) * 0.14
+    + (scores.storyValue || 0) * 0.16
+  );
 }
 
 function BrainReviewPanel({
@@ -1827,12 +1964,26 @@ function BrainReviewPanel({
       : undefined;
   const accepted = Boolean(recommendedDecision && photoDecision === recommendedDecision);
   const decisionText = recommendedDecision ? decisionLabel(recommendedDecision) : '';
+  const deliverableScore = review.visualScores.deliverableScore;
+  const curationScore = reviewCurationScore(review);
+  const reasonText = productReviewText(review.reason);
+  const groupReasonText = productReviewText(review.groupReason);
 
   return (
     <section className="brain-review-panel">
       <div className="brain-review-head">
         <span><Brain size={15} /> 小宫判断</span>
-        <em>{scorePct(review.confidence)}%</em>
+        <em title="这是小宫对当前判断的置信度，不是审美排序分。">判断置信度 {scorePct(review.confidence)}%</em>
+      </div>
+      <div className="brain-score-summary">
+        <div title="照片作为交付/展示候选的完成度。">
+          <span>交付分</span>
+          <strong>{scorePct(deliverableScore)}</strong>
+        </div>
+        <div title="由画面、表情、瞬间、构图、背景和故事综合得到的参考分。">
+          <span>综合参考</span>
+          <strong>{scorePct(curationScore)}</strong>
+        </div>
       </div>
       <div className="brain-bucket-line">
         <strong>{bucketText(review.primaryBucket)}</strong>
@@ -1840,11 +1991,11 @@ function BrainReviewPanel({
           {accepted ? `已采纳：${decisionText}` : actionText(review.recommendedAction)}
         </span>
       </div>
-      <p className="brain-reason" title={review.reason}>{review.reason}</p>
+      <p className="brain-reason" title={reasonText}>{reasonText}</p>
       {review.smallModelOverrides.length > 0 && (
         <div className="brain-overrides">
-          <strong>推翻小模型</strong>
-          {review.smallModelOverrides.map((item) => <span key={item} title={item}>{item}</span>)}
+          <strong>小宫修正</strong>
+          {review.smallModelOverrides.map((item) => <span key={item} title={smallModelOverrideTitle(item)}>{smallModelOverrideText(item)}</span>)}
         </div>
       )}
       {review.needsHumanReview && <div className="brain-review-alert">需要人工复核</div>}
@@ -1856,7 +2007,7 @@ function BrainReviewPanel({
           </div>
         ))}
       </div>
-      {review.groupReason && <p className="brain-group-reason" title={review.groupReason}>{review.groupReason}</p>}
+      {groupReasonText && <p className="brain-group-reason" title={groupReasonText}>{groupReasonText}</p>}
       <div className="brain-review-actions">
         {accepted ? (
           <div className="brain-review-accepted"><Check size={14} /> 已按小宫判断更新当前照片状态</div>

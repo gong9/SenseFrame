@@ -32,6 +32,41 @@ function compactReview(review: any): Record<string, unknown> {
   };
 }
 
+function reviewSignal(review: any): Record<string, unknown> {
+  const scores = review?.visualScores || {};
+  return {
+    photoId: review?.photoId,
+    bucket: review?.primaryBucket,
+    action: review?.recommendedAction,
+    confidence: review?.confidence,
+    source: review?.reviewSource,
+    sheetId: review?.sheetId,
+    cell: review?.sheetCell,
+    needsHumanReview: review?.needsHumanReview,
+    deliverableScore: scores.deliverableScore,
+    curationScore: typeof scores.visualQuality === 'number'
+      ? Number((
+          scores.visualQuality * 0.18
+          + scores.expression * 0.18
+          + scores.moment * 0.18
+          + scores.composition * 0.16
+          + scores.backgroundCleanliness * 0.14
+          + scores.storyValue * 0.16
+        ).toFixed(3))
+      : undefined,
+    fatalFlaws: review?.fatalFlaws,
+    reasonBrief: typeof review?.reason === 'string' ? review.reason.slice(0, 120) : undefined
+  };
+}
+
+function topReviewSignals(reviews: any[], predicate: (review: any) => boolean, limit: number): Record<string, unknown>[] {
+  return reviews
+    .filter(predicate)
+    .sort((a, b) => Number(b?.visualScores?.deliverableScore ?? b?.confidence ?? 0) - Number(a?.visualScores?.deliverableScore ?? a?.confidence ?? 0))
+    .slice(0, limit)
+    .map(reviewSignal);
+}
+
 function compactToolOutput(toolName: string, output: any): unknown {
   if (toolName === 'GetBatchOverview') {
     const photos = Array.isArray(output?.photos) ? output.photos : [];
@@ -63,10 +98,20 @@ function compactToolOutput(toolName: string, output: any): unknown {
     };
   }
   if (toolName === 'ReviewContactSheetWithVision') {
+    const reviews = Array.isArray(output?.reviews) ? output.reviews : [];
     return {
       sheetId: output?.sheetId,
       sheetSummary: output?.sheetSummary,
-      reviews: Array.isArray(output?.reviews) ? output.reviews.map(compactReview) : [],
+      coverage: {
+        reviewed: reviews.length,
+        photoIds: reviews.map((review: any) => review?.photoId).filter(Boolean)
+      },
+      bucketCounts: reviews.reduce((acc: Record<string, number>, review: any) => {
+        const key = String(review?.primaryBucket || 'pending');
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {}),
+      candidateSignals: topReviewSignals(reviews, (review) => review?.primaryBucket === 'featured' || review?.recommendedAction === 'pick' || review?.needsHumanReview, 8),
       singleVisionPhotoIds: output?.singleVisionPhotoIds,
       cacheHit: output?.cacheHit
     };
@@ -102,7 +147,7 @@ function compactToolOutput(toolName: string, output: any): unknown {
 }
 
 function summarizeToolOutput(toolName: string, output: any): string {
-  return summarize(compactToolOutput(toolName, output), 12000);
+  return summarize(compactToolOutput(toolName, output), 7000);
 }
 
 function asToolDefinitions(tools: BrainToolDefinition[]): Record<string, unknown>[] {
@@ -122,11 +167,14 @@ function toolsForMode(mode: BrainRuntimeRequest['mode'], tools: BrainToolDefinit
     'GetBatchOverview',
     'GetVisionRuntimeStatus',
     'DecideReviewStrategy',
+    'CreateCompressedReviewContactSheets',
     'CreateReviewContactSheets',
+    'ValidateReviewContactSheet',
     'ReviewContactSheetWithVision',
     'ReviewPhotoWithVision',
     'CompareSimilarGroupWithVision',
-    'WriteBrainReviewResult'
+    'WriteBrainReviewResult',
+    'CreateSmartView'
   ]);
   return tools.filter((tool) => reviewTools.has(tool.name));
 }
@@ -144,19 +192,24 @@ function systemPrompt(mode: BrainRuntimeRequest['mode']): string {
     mode === 'review'
       ? [
           '当前任务来自“小宫审片”按钮，禁止调用 StartBrainReview 或任何 legacy 大工作流。',
-          '小宫审片的产品结果是改 AI 分组和照片判断，不是创建或打开小宫视图。',
+          '小宫审片的产品结果首先是改 AI 分组和照片判断；写入全批结果后，还要用 CreateSmartView 创建本次审片结果视图，方便用户立刻查看大脑筛出的照片。',
           'GetBatchOverview 里的 brainRun/brainReview 只是历史审片结果，不能视为本次审片已经完成，不能沿用旧结果跳过本次全量视觉覆盖。',
           '本次审片必须产生新的 full-batch reviews，并由 WriteBrainReviewResult 写入新的 brain_runs。禁止用空 reviews 调用 WriteBrainReviewResult，也禁止只精看当前照片后结束。',
           '你必须像专业摄影师一样先理解整批，再自己选择合适工具。不要把下面能力当固定工作流。',
           '你可以调用 GetVisionRuntimeStatus 查看本次应用生命周期内已经完成的真实视觉覆盖和缓存，避免重复看同一张照片或同一张审片板。',
-          '可用策略包括：小批次可以单张精看；中大型批次可用 CreateReviewContactSheets 生成审片板，再用 ReviewContactSheetWithVision 让大脑通过缩略图墙看到整批，然后对关键照片 ReviewPhotoWithVision 高清精看，必要时 CompareSimilarGroupWithVision。',
-          'CreateReviewContactSheets 是视觉载体生成工具，不是固定工作流。你可以根据任务和失败反馈主动控制 photoIds、cellsPerSheet、columns、cellWidth、cellHeight、imageHeight、jpegQuality、detail、idPrefix。',
-          '已知约束：模型视觉请求可能受网络、请求体、base64 大小、模型视觉通道限制影响。工具会返回 fileSizeBytes、base64ApproxBytes、imageWidth、imageHeight、cells、photoIds、params；遇到 ReviewContactSheetWithVision 失败时，必须读取这些指标，自主决定压缩、拆分、降低 detail、只重建失败 photoIds，继续补齐视觉覆盖。重建失败部分时使用新的 idPrefix，方便追踪新审片板。',
-          '最终 WriteBrainReviewResult 必须覆盖整批每一张照片；只写部分照片会被工具拒绝。',
+          'GetVisionRuntimeStatus 会返回本次 runtime 已累积的 coveredPhotoIds、missingPhotoIds、bucketCounts、candidateSignals。视觉工具结果在上下文里只给压缩摘要，完整草稿由 runtime 记住；最终可直接调用 WriteBrainReviewResult，runtime 会自动补入已累积的全量 reviews。',
+          '在生成大型审片板或补失败照片之前，优先调用 CreateCompressedReviewContactSheets，并由你自己显式决定 photoIds、cellsPerSheet、columns、cellWidth、cellHeight、imageHeight、jpegQuality、detail、targetBudgetBytes。工具只执行压缩生成并返回真实体积，不替你选择策略。',
+          '可用策略包括：小批次可以单张精看；中大型批次可用 CreateReviewContactSheets 生成审片板，必要时 ValidateReviewContactSheet 校验证据工件，再用 ReviewContactSheetWithVision 让大脑通过缩略图墙看到整批，然后对关键照片 ReviewPhotoWithVision 高清精看，必要时 CompareSimilarGroupWithVision。',
+          'CreateReviewContactSheets 是视觉载体生成工具，不是固定工作流。你可以根据任务和失败反馈主动控制 photoIds、cellsPerSheet、columns、cellWidth、cellHeight、imageHeight、jpegQuality、detail、idPrefix。工具会返回 validation 和 payload 指标；validation 不通过时必须先修复或重建，不要用坏证据下结论。',
+          '已知约束：模型视觉请求可能受网络、请求体、base64 大小、模型视觉通道限制影响。工具会返回 fileSizeBytes、base64ApproxBytes、estimatedRequestBytes、imageWidth、imageHeight、cells、photoIds、params、validation；遇到 ReviewContactSheetWithVision 失败时，必须读取这些指标，自主决定压缩、拆分、降低 detail、只重建失败 photoIds，继续补齐视觉覆盖。重建失败部分时使用新的 idPrefix，方便追踪新审片板。',
+          '最终 WriteBrainReviewResult 必须覆盖整批每一张照片；只写部分照片会被工具拒绝。WriteBrainReviewResult 成功后，再调用 CreateSmartView：如果有 featured，就创建精选视图；如果 featured 为 0，就创建最值得看的 keeper/复核候选视图，并在 summary 里明确不是作品级精选。',
+          'CreateSmartView 必须传入你明确选定的 photoIds；不要让工具自动排序。视图数量由你根据审片结果决定，不要固定张数。',
           'ReviewPhotoWithVision 只返回单张草稿，不写库；CompareSimilarGroupWithVision 只返回组比较草稿，不写库；只有 WriteBrainReviewResult 可以写入 brain_*。',
           '不要固定审片张数。大脑必须至少通过审片板看过整批；单张高清精看用于精选、疑难、闭眼/表情争议和组内代表候选。',
           'featured 是交付级精选/封面候选，不是“有一点候选价值”。如果整批都很差，可以 0 张或极少张 featured。普通有情绪但背景杂、逆光灰雾、主体糊、构图随拍的照片应归 similarBursts/eyeReview/technical，而不是 featured。',
+          'recommendedAction=maybe 表示建议保留/备选 keeper，不等于不确定；recommendedAction=review 才表示需要人工复核。普通 keeper 不要全部 needsHumanReview=true。',
           'recommendedAction=maybe/review 的照片默认不是 featured；除非高清单张确认达到交付级，否则只能作为备选或复核。',
+          '写给用户看的 reason、groupReason、summary 必须使用摄影师能理解的中文产品话术；禁止出现 cell、keeper、featured、bucket、primaryBucket、recommendedAction、photoId 等内部字段或英文分组名。可以说“同组相邻照片”“保留备选”“精选候选”“建议淘汰”。',
           '每张照片结果要保留 reviewSource：sheet_vision 表示审片板看过，single_vision 表示单张高清看过，group_vision 表示组比较判断。'
         ].join('\n')
       : ''
@@ -192,7 +245,9 @@ function toolProductCopy(toolName: string): { phase: BrainUiLogEvent['phase']; t
     GetBatchOverview: { phase: 'understanding', title: '理解整批照片', message: '正在汇总质量分布、风险标签、人工选择和连拍结构。' },
     GetVisionRuntimeStatus: { phase: 'planning', title: '检查视觉覆盖', message: '正在确认哪些审片板和照片已经看过，避免重复请求。' },
     DecideReviewStrategy: { phase: 'planning', title: '制定审片策略', message: '正在决定哪些照片需要看图、哪些连拍组需要比较。' },
+    CreateCompressedReviewContactSheets: { phase: 'vision', title: '压缩审片板', message: '正在按请求体预算生成压缩后的审片板。' },
     CreateReviewContactSheets: { phase: 'vision', title: '生成整批审片板', message: '正在把整批照片排成缩略图墙，方便小宫一次覆盖全部素材。' },
+    ValidateReviewContactSheet: { phase: 'vision', title: '校验审片板', message: '正在检查缩略图墙是否完整、可解码、映射正确。' },
     ReviewContactSheetWithVision: { phase: 'vision', title: '查看审片板', message: '小宫正在通过缩略图墙扫完整批照片。' },
     GetCurrentPhoto: { phase: 'understanding', title: '读取当前照片' },
     GenerateLocalCandidates: { phase: 'planning', title: '整理候选线索' },
@@ -214,18 +269,21 @@ function toolProductCopy(toolName: string): { phase: BrainUiLogEvent['phase']; t
 
 function shouldAbortSiblingToolCalls(result: BrainToolResult): boolean {
   if (!result.isError) return false;
-  if (result.toolName === 'ReviewContactSheetWithVision') return true;
-  if (result.toolName === 'ReviewPhotoWithVision' && result.content.includes('vision_payload_or_network_failure')) return true;
+  if (result.toolName === 'ReviewContactSheetWithVision' || result.toolName === 'ReviewPhotoWithVision') {
+    return /vision_payload_or_network_failure|Payload Too Large|fetch failed|timeout|超时|413|ETIMEDOUT|ECONNRESET|ENOTFOUND/i.test(result.content);
+  }
   return false;
 }
 
 function isParallelVisionTool(toolName: string): boolean {
-  return toolName === 'ReviewPhotoWithVision' || toolName === 'ReviewContactSheetWithVision';
+  return toolName === 'ReviewPhotoWithVision' || toolName === 'ReviewContactSheetWithVision' || toolName === 'CompareSimilarGroupWithVision';
 }
 
 function visionToolConcurrency(toolName: string): number {
   const configured = Number(process.env.SENSEFRAME_BRAIN_VISION_CONCURRENCY);
   if (Number.isFinite(configured) && configured >= 1) return Math.min(6, Math.floor(configured));
+  if (toolName === 'ReviewContactSheetWithVision') return 3;
+  if (toolName === 'CompareSimilarGroupWithVision') return 3;
   return toolName === 'ReviewPhotoWithVision' ? 3 : 2;
 }
 
@@ -270,7 +328,8 @@ export async function runSenseFrameBrainRuntime(
     traceId,
     batchId: request.batchId,
     activePhotoId: request.activePhotoId,
-    emitLog
+    emitLog,
+    getPhotoReviewDrafts: () => [...photoReviewDrafts.values()]
   };
 
   appendTrace(traceId, 'runtime.started', { request, model: config.model });
@@ -443,12 +502,28 @@ export async function runSenseFrameBrainRuntime(
       message: `第 ${turn + 1} 轮`
     });
 
-    const response = await callChatCompletions(config, {
-      messages,
-      tools: asToolDefinitions(tools),
-      tool_choice: 'auto',
-      response_format: { type: 'json_object' }
-    });
+    let response: any;
+    try {
+      response = await callChatCompletions(config, {
+        messages,
+        tools: asToolDefinitions(tools),
+        tool_choice: 'auto',
+        response_format: { type: 'json_object' }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendTrace(traceId, 'model.failed', { turn: turn + 1, error: message });
+      emitLog({
+        level: 'error',
+        phase: 'failed',
+        title: '模型请求失败',
+        message
+      }, 'failed');
+      finalStatus = 'failed';
+      finalMessage = `小宫大脑模型请求失败：${message}`;
+      finalSummary = finalMessage;
+      break;
+    }
     appendTrace(traceId, 'model.response', response);
     const message = response.choices?.[0]?.message || {};
     const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];

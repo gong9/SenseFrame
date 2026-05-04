@@ -2,7 +2,9 @@
 
 English | [简体中文](README.zh-CN.md)
 
-![SenseFrame desktop review workspace](docs/assets/senseframe-main-2026-05-02.png)
+![SenseFrame start screen](docs/assets/senseframe-home-2026-05-04.png)
+
+![SenseFrame desktop review workspace](docs/assets/senseframe-main-2026-05-04.png)
 
 SenseFrame is a local-first AI culling workstation for photographers who need to review large shoots without losing control of their own taste.
 

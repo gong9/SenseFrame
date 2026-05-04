@@ -1,10 +1,11 @@
 import crypto from 'node:crypto';
 import { getDb } from '../db';
 import { getBatch } from '../photoPipeline';
-import { buildBatchContext, bucketCounts, callVisionModel, createHeuristicReview, parseReview, saveReview } from '../brainService';
+import { buildBatchContext, bucketCounts, createHeuristicReview, parseReview, saveReview } from '../brainService';
+import { createImageInput, imageInputCacheStats, type ImageInputArtifact } from '../brainRuntime/imageInputAdapter';
 import { callChatCompletions, getModelConfig } from '../brainRuntime/modelProvider';
 import { photoAestheticPrompt } from '../brainRuntime/photoAestheticRubric';
-import { createReviewContactSheets, imageFileDataUrl, type ReviewContactSheet, type ReviewContactSheetOptions } from '../brainReviewSheets';
+import { createReviewContactSheets, validateReviewContactSheet, type ReviewContactSheet, type ReviewContactSheetOptions } from '../brainReviewSheets';
 import { createSmartView, getSmartView } from '../xiaogongSmartViewService';
 import type {
   BatchView,
@@ -33,6 +34,7 @@ const photoVisionCache = new Map<string, {
   review: BrainPhotoReviewDraft;
   createdAt: string;
 }>();
+const failedVisionArtifacts = new Map<string, Array<Record<string, unknown>>>();
 
 function cacheKey(...parts: Array<string | undefined>): string {
   return parts.map((part) => String(part || '')).join('::');
@@ -49,6 +51,8 @@ function cacheStats(batchId: string): Record<string, unknown> {
     cachedContactSheets: sheetEntries.length,
     cachedSinglePhotos: photoEntries.length,
     cachedReviewedPhotos: reviewedPhotoIds.size,
+    imageInput: imageInputCacheStats(),
+    failedArtifacts: failedVisionArtifacts.get(batchId)?.slice(-12) || [],
     latestContactSheets: sheetEntries.slice(-8).map(([, value]) => ({
       sheetId: value.sheetId,
       reviews: value.reviews.length,
@@ -59,6 +63,57 @@ function cacheStats(batchId: string): Record<string, unknown> {
       primaryBucket: value.review.primaryBucket,
       createdAt: value.createdAt
     }))
+  };
+}
+
+function draftSignal(review: BrainPhotoReviewDraft): Record<string, unknown> {
+  const scores = review.visualScores;
+  return {
+    photoId: review.photoId,
+    bucket: review.primaryBucket,
+    action: review.recommendedAction,
+    confidence: review.confidence,
+    source: review.reviewSource,
+    sheetId: review.sheetId,
+    cell: review.sheetCell,
+    needsHumanReview: review.needsHumanReview,
+    deliverableScore: scores.deliverableScore,
+    curationScore: Number((
+      scores.visualQuality * 0.18
+      + scores.expression * 0.18
+      + scores.moment * 0.18
+      + scores.composition * 0.16
+      + scores.backgroundCleanliness * 0.14
+      + scores.storyValue * 0.16
+    ).toFixed(3)),
+    fatalFlaws: review.fatalFlaws,
+    reasonBrief: review.reason.slice(0, 120)
+  };
+}
+
+function runtimeDraftStats(batch: BatchView, drafts: BrainPhotoReviewDraft[]): Record<string, unknown> {
+  const known = new Set(batch.photos.map((photo) => photo.id));
+  const validDrafts = drafts.filter((draft) => known.has(draft.photoId));
+  const covered = new Set(validDrafts.map((draft) => draft.photoId));
+  const missingPhotos = batch.photos.filter((photo) => !covered.has(photo.id));
+  const candidates = validDrafts
+    .filter((draft) => draft.primaryBucket === 'featured' || draft.recommendedAction === 'pick' || draft.needsHumanReview)
+    .sort((a, b) => Number(b.visualScores.deliverableScore ?? b.confidence) - Number(a.visualScores.deliverableScore ?? a.confidence))
+    .slice(0, 24)
+    .map(draftSignal);
+  return {
+    runtimeDraftCount: validDrafts.length,
+    coveredPhotoIds: [...covered],
+    missingPhotoIds: missingPhotos.map((photo) => photo.id),
+    missingPhotoSamples: missingPhotos.slice(0, 12).map((photo) => ({
+      photoId: photo.id,
+      fileName: photo.fileName,
+      score: photo.analysis?.finalScore,
+      riskFlags: photo.analysis?.riskFlags || []
+    })),
+    runtimeBucketCounts: countBy(validDrafts.map((draft) => draft.primaryBucket)),
+    runtimeSourceCounts: countBy(validDrafts.map((draft) => draft.reviewSource || 'unknown')),
+    candidateSignals: candidates
   };
 }
 
@@ -77,20 +132,51 @@ function sheetPayloadSummary(sheet: ReviewContactSheet): Record<string, unknown>
     fileSizeBytes: sheet.fileSizeBytes,
     base64ApproxBytes: sheet.base64ApproxBytes,
     params: sheet.params,
+    validation: sheet.validation,
     photoIds: sheet.cells.map((cell) => cell.photoId)
   };
 }
 
-function recoverableVisionSheetError(sheet: ReviewContactSheet, message: string): string {
+function requestEstimateFromImageInput(input?: ImageInputArtifact): Record<string, unknown> | undefined {
+  if (!input) return undefined;
+  return {
+    sourcePath: input.sourcePath,
+    originalFileSizeBytes: input.originalFileSizeBytes,
+    encodedBytes: input.encodedBytes,
+    base64ApproxBytes: input.base64ApproxBytes,
+    estimatedRequestBytes: input.estimatedRequestBytes,
+    originalWidth: input.originalWidth,
+    originalHeight: input.originalHeight,
+    width: input.width,
+    height: input.height,
+    params: input.params,
+    cacheHit: input.cacheHit
+  };
+}
+
+function recordFailedVisionArtifact(batchId: string, artifact: Record<string, unknown>): void {
+  const current = failedVisionArtifacts.get(batchId) || [];
+  current.push({ ...artifact, at: now() });
+  failedVisionArtifacts.set(batchId, current.slice(-24));
+}
+
+function recoverableVisionSheetError(sheet: ReviewContactSheet, message: string, imageInput?: ImageInputArtifact): string {
   return JSON.stringify({
     errorType: 'vision_payload_or_network_failure',
     message,
     failedSheet: sheetPayloadSummary(sheet),
+    requestEstimate: requestEstimateFromImageInput(imageInput),
+    recoveryOptions: [
+      { tool: 'CreateCompressedReviewContactSheets', change: 'lower_cells_per_sheet', suggested: { cellsPerSheet: Math.max(1, Math.floor(sheet.params.cellsPerSheet / 2)), columns: Math.max(1, Math.min(sheet.params.columns, 3)), detail: 'low' } },
+      { tool: 'CreateCompressedReviewContactSheets', change: 'lower_pixels_and_quality', suggested: { cellWidth: Math.max(96, Math.floor(sheet.params.cellWidth * 0.72)), cellHeight: Math.max(140, Math.floor(sheet.params.cellHeight * 0.72)), imageHeight: Math.max(90, Math.floor(sheet.params.imageHeight * 0.72)), jpegQuality: Math.max(42, sheet.params.jpegQuality - 16), detail: 'low' } },
+      { tool: 'CreateCompressedReviewContactSheets', change: 'split_failed_photo_ids', suggested: { photoIds: sheet.cells.map((cell) => cell.photoId), cellsPerSheet: Math.max(1, Math.ceil(sheet.cells.length / 3)), columns: 2, detail: 'low' } },
+      { tool: 'ReviewPhotoWithVision', change: 'single_photo_backfill', suggested: { photoIds: sheet.cells.map((cell) => cell.photoId), imageMode: 'preview', maxDimension: 960, jpegQuality: 70, detail: 'low' } }
+    ],
     recoveryHints: [
       '这通常说明当前审片板视觉请求在网络、请求体或模型视觉通道上不稳定。',
       '不要放弃全批覆盖，也不要只看少量候选。',
-      '可以调用 CreateReviewContactSheets，仅传 failedSheet.photoIds，并主动降低 cellsPerSheet、cellWidth、cellHeight、imageHeight、jpegQuality，或改 detail=low，然后继续 ReviewContactSheetWithVision。',
-      '如果仍失败，可以进一步拆小 failedSheet.photoIds，直到覆盖完成。'
+      '可以调用 CreateCompressedReviewContactSheets，仅传 failedSheet.photoIds，并主动降低 cellsPerSheet、cellWidth、cellHeight、imageHeight、jpegQuality，或改 detail=low，然后继续 ReviewContactSheetWithVision。',
+      '如果仍失败，可以进一步拆小 failedSheet.photoIds，cellsPerSheet=1、columns=1 是允许的，用它逐张补齐失败照片。'
     ]
   }, null, 2);
 }
@@ -350,6 +436,22 @@ function validatePhotoIds(batch: BatchView, ids: unknown): string[] {
   return Array.isArray(ids) ? ids.map(String).filter((id) => known.has(id)) : [];
 }
 
+function sheetOutputSummary(sheet: ReviewContactSheet): Record<string, unknown> {
+  return {
+    id: sheet.id,
+    index: sheet.index,
+    total: sheet.total,
+    photoCount: sheet.cells.length,
+    imageWidth: sheet.imageWidth,
+    imageHeight: sheet.imageHeight,
+    fileSizeBytes: sheet.fileSizeBytes,
+    base64ApproxBytes: sheet.base64ApproxBytes,
+    params: sheet.params,
+    validation: sheet.validation,
+    photoIds: sheet.cells.map((cell) => cell.photoId)
+  };
+}
+
 function parseJsonObject(text: string): Record<string, any> {
   try {
     return JSON.parse(text);
@@ -507,6 +609,24 @@ function featuredWorthy(input: {
   return standoutCount(input.scores) >= 2;
 }
 
+function keeperWorthy(input: {
+  action: Decision | 'review';
+  confidence: number;
+  scores: BrainVisualScores;
+  photo: PhotoView;
+  fatalFlaws?: string[];
+}): boolean {
+  if (input.action === 'reject' || input.action === 'none') return false;
+  const flags = new Set(input.photo.analysis?.riskFlags || []);
+  const fatal = new Set(input.fatalFlaws || []);
+  if (fatal.has('missed_focus') || fatal.has('face_blur') || fatal.has('bad_crop')) return false;
+  if (flags.has('possible_blur') && (input.scores.subjectClarity ?? input.scores.visualQuality) < 0.55) return false;
+  const deliverable = input.scores.deliverableScore ?? curationScore(input.scores);
+  const emotionOrStory = input.scores.expression >= 0.6 || input.scores.moment >= 0.6 || input.scores.storyValue >= 0.6;
+  const technicallyUsable = input.scores.visualQuality >= 0.52 && input.scores.composition >= 0.48 && (input.scores.subjectClarity ?? input.scores.visualQuality) >= 0.5;
+  return input.confidence >= 0.58 && deliverable >= 0.52 && emotionOrStory && technicallyUsable;
+}
+
 function demoteWeakFeatured(
   bucket: BrainBucket,
   action: Decision | 'review',
@@ -519,6 +639,7 @@ function demoteWeakFeatured(
 ): BrainBucket {
   if (bucket !== 'featured') return bucket;
   if (featuredWorthy({ action, confidence, scores, source, aestheticPass, fatalFlaws })) return 'featured';
+  if (keeperWorthy({ action, confidence, scores, photo, fatalFlaws })) return hasCriticalRisk(photo) ? 'eyeReview' : 'similarBursts';
   if (action === 'review') return hasCriticalRisk(photo) ? 'eyeReview' : 'similarBursts';
   if (action === 'reject') return hasCriticalRisk(photo) ? 'technical' : 'similarBursts';
   return hasCriticalRisk(photo) ? 'eyeReview' : 'similarBursts';
@@ -529,14 +650,14 @@ function needsHumanReviewFromDraft(draft: any, photo?: PhotoView, source?: Brain
   const bucket = String(draft?.primaryBucket || draft?.primary_bucket || '').toLowerCase();
   const confidence = clamp01(draft?.confidence ?? 0.5, 0.5);
   const explicit = Boolean(draft?.needsHumanReview ?? draft?.needs_human_review);
-  if (source === 'single_vision' || source === 'group_vision') return explicit || confidence < 0.7 || action === 'review' || action === 'maybe';
+  if (source === 'single_vision' || source === 'group_vision') return explicit || confidence < 0.7 || action === 'review' || (action === 'maybe' && (hasCriticalRisk(photo) || confidence < 0.72));
   if (hasCriticalRisk(photo)) return true;
   if (action === 'review') return true;
   if (action === 'reject') return false;
   if (action === 'pick' && confidence >= 0.8 && !hasCriticalRisk(photo)) return explicit && confidence < 0.88;
   if (bucket === 'featured' && confidence >= 0.78 && !hasCriticalRisk(photo)) return false;
   if (bucket === 'eyereview' || bucket === 'technical' || bucket === 'pending') return true;
-  if (action === 'maybe') return confidence < 0.72 || bucket === 'featured';
+  if (action === 'maybe') return confidence < 0.66 || bucket === 'featured' || hasCriticalRisk(photo);
   return explicit && confidence < 0.7;
 }
 
@@ -592,13 +713,16 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
       },
       handler: (_input, context) => {
         const batch = getBatch(context.batchId);
+        const runtimeDrafts = context.getPhotoReviewDrafts?.() || [];
         return {
           batchId: batch.id,
           totalPhotos: batch.photos.length,
+          ...runtimeDraftStats(batch, runtimeDrafts),
           ...cacheStats(context.batchId),
           guidance: [
-            '如果 cachedReviewedPhotos 已覆盖整批，可以直接基于已有草稿写入或继续少量高清复核。',
-            '如果只缺少少量照片，应优先生成缺失 photoIds 的审片板或单张复核，避免重复看已经缓存的照片。',
+            '优先看 runtimeDraftCount/coveredPhotoIds/missingPhotoIds，它们是本次 runtime 已累积的草稿覆盖，不只是缓存数量。',
+            '如果 missingPhotoIds 为空，可以直接少量高清复核候选，然后调用 WriteBrainReviewResult；runtime 会自动补入已累积的全量 reviews。',
+            '如果只缺少少量照片，应优先仅传 missingPhotoIds 生成审片板；失败时允许 cellsPerSheet=1、columns=1 逐张补齐。',
             '缓存来自本次应用生命周期内的真实视觉工具结果，不代表历史 brainRun。'
           ]
         };
@@ -715,7 +839,7 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
     },
     {
       name: 'CreateReviewContactSheets',
-      description: '生成覆盖整批或指定照片的审片板。小宫可以主动控制 photoIds、cellsPerSheet、columns、cellWidth、cellHeight、imageHeight、jpegQuality、detail、idPrefix 来优化视觉载体；工具会校验边界并返回真实 payload 指标。',
+      description: '生成覆盖整批或指定照片的审片板。小宫可以主动控制 photoIds、cellsPerSheet、columns、cellWidth、cellHeight、imageHeight、jpegQuality、detail、idPrefix 来优化视觉载体；失败恢复时允许 cellsPerSheet=1、columns=1 逐张补齐；工具会校验边界并返回真实 payload 指标。',
       permissionLevel: 'brain_write',
       requiresConfirmation: false,
       parameters: {
@@ -738,29 +862,148 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
         const batch = getBatch(context.batchId);
         const sheets = await createReviewContactSheets(context.batchId, batch.photos, contactSheetOptionsFromInput(input, batch));
         storeReviewSheets(context.batchId, sheets);
+        const invalid = sheets.filter((sheet) => !sheet.validation?.ok);
         context.emitLog({
-          level: 'success',
+          level: invalid.length ? 'warning' : 'success',
           phase: 'vision',
           title: '生成整批审片板',
-          message: `已生成 ${sheets.length} 张审片板，覆盖 ${sheets.reduce((sum, sheet) => sum + sheet.cells.length, 0)} 张照片。`,
+          message: invalid.length
+            ? `已生成 ${sheets.length} 张审片板，覆盖 ${sheets.reduce((sum, sheet) => sum + sheet.cells.length, 0)} 张照片，但 ${invalid.length} 张校验有问题，需要先重建或校验。`
+            : `已生成 ${sheets.length} 张审片板，覆盖 ${sheets.reduce((sum, sheet) => sum + sheet.cells.length, 0)} 张照片。`,
           progress: { current: sheets.length, total: sheets.length }
         });
         return {
           strategySummary: String(input?.strategySummary || '小宫决定先用审片板全量扫完整批，再挑关键照片高清精看。'),
           totalPhotos: batch.photos.length,
           coveredPhotos: sheets.reduce((sum, sheet) => sum + sheet.cells.length, 0),
-          sheets: sheets.map((sheet) => ({
-            id: sheet.id,
-            index: sheet.index,
-            total: sheet.total,
-            photoCount: sheet.cells.length,
-            imageWidth: sheet.imageWidth,
-            imageHeight: sheet.imageHeight,
-            fileSizeBytes: sheet.fileSizeBytes,
-            base64ApproxBytes: sheet.base64ApproxBytes,
-            params: sheet.params,
-            photoIds: sheet.cells.map((cell) => cell.photoId)
-          }))
+          validation: {
+            ok: invalid.length === 0,
+            invalidSheetIds: invalid.map((sheet) => sheet.id)
+          },
+          sheets: sheets.map(sheetOutputSummary)
+        };
+      }
+    },
+    {
+      name: 'CreateCompressedReviewContactSheets',
+      description: '按小宫大脑显式给出的压缩参数真实生成审片板。这个工具不替大脑选择策略；大脑必须自己决定 photoIds、cellsPerSheet、columns、cellWidth、cellHeight、imageHeight、jpegQuality、detail、targetBudgetBytes。工具只执行压缩、生成 sheet，并返回真实 base64/request 体积和是否超预算。',
+      permissionLevel: 'brain_write',
+      requiresConfirmation: false,
+      parameters: {
+        type: 'object',
+        properties: {
+          photoIds: { type: 'array', items: { type: 'string' } },
+          targetBudgetBytes: { type: 'number' },
+          cellsPerSheet: { type: 'number' },
+          columns: { type: 'number' },
+          cellWidth: { type: 'number' },
+          cellHeight: { type: 'number' },
+          imageHeight: { type: 'number' },
+          jpegQuality: { type: 'number' },
+          detail: { type: 'string', enum: ['low', 'high'] },
+          idPrefix: { type: 'string' },
+          failIfOverBudget: { type: 'boolean' },
+          strategySummary: { type: 'string' }
+        },
+        required: ['cellsPerSheet', 'columns', 'cellWidth', 'cellHeight', 'imageHeight', 'jpegQuality', 'detail'],
+        additionalProperties: false
+      },
+      handler: async (input, context) => {
+        const batch = getBatch(context.batchId);
+        const photoIds = validatePhotoIds(batch, input?.photoIds);
+        const targetPhotos = photoIds.length
+          ? photoIds
+          : batch.photos.filter((photo) => photo.status === 'ready' && photo.previewPath).map((photo) => photo.id);
+        const targetBudgetBytes = Math.max(12000, Math.min(180000, Number(input?.targetBudgetBytes) || 32000));
+        const idPrefix = String(input?.idPrefix || 'compressed').replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 48);
+        const sheets = await createReviewContactSheets(context.batchId, batch.photos, {
+          ...contactSheetOptionsFromInput(input, batch),
+          idPrefix,
+          photoIds: targetPhotos
+        });
+        storeReviewSheets(context.batchId, sheets);
+        const maxBase64 = Math.max(...sheets.map((sheet) => sheet.base64ApproxBytes), 0);
+        const overBudget = sheets.filter((sheet) => sheet.base64ApproxBytes + sheet.cells.length * 1200 + 4200 > targetBudgetBytes);
+        const invalid = sheets.filter((sheet) => !sheet.validation?.ok);
+        if (input?.failIfOverBudget && overBudget.length) {
+          throw new Error(JSON.stringify({
+            errorType: 'compressed_sheet_over_budget',
+            targetBudgetBytes,
+            overBudgetSheets: overBudget.map(sheetOutputSummary),
+            recoveryHints: [
+              '这是压缩执行结果超出预算，不是最终失败。',
+              '大脑可以继续降低 cellsPerSheet、cellWidth、cellHeight、imageHeight、jpegQuality，或把 photoIds 拆得更小后再次调用 CreateCompressedReviewContactSheets。',
+              '少量补洞时可使用 cellsPerSheet=1、columns=1。'
+            ]
+          }, null, 2));
+        }
+        context.emitLog({
+          level: overBudget.length || invalid.length ? 'warning' : 'success',
+          phase: 'vision',
+          title: '压缩审片板',
+          message: invalid.length
+            ? `已按大脑指定参数生成 ${sheets.length} 张压缩审片板，最大 base64 约 ${maxBase64} bytes；${invalid.length} 张校验有问题。`
+            : `已按大脑指定参数生成 ${sheets.length} 张压缩审片板，最大 base64 约 ${maxBase64} bytes。`,
+          progress: { current: sheets.length, total: sheets.length }
+        });
+        return {
+          strategySummary: String(input?.strategySummary || '小宫使用自己指定的压缩参数生成审片板。'),
+          compression: {
+            targetBudgetBytes,
+            appliedOptions: sheets[0]?.params,
+            maxBase64ApproxBytes: maxBase64,
+            maxEstimatedRequestBytes: Math.max(...sheets.map((sheet) => sheet.base64ApproxBytes + sheet.cells.length * 1200 + 4200), 0),
+            overBudgetSheetIds: overBudget.map((sheet) => sheet.id)
+          },
+          validation: {
+            ok: invalid.length === 0,
+            invalidSheetIds: invalid.map((sheet) => sheet.id)
+          },
+          totalPhotos: batch.photos.length,
+          coveredPhotos: sheets.reduce((sum, sheet) => sum + sheet.cells.length, 0),
+          sheets: sheets.map(sheetOutputSummary)
+        };
+      }
+    },
+    {
+      name: 'ValidateReviewContactSheet',
+      description: '校验一张或多张审片板视觉工件是否可用：文件存在、可解码、尺寸匹配、cell/photoId 映射正确、不是明显空白。这个工具只校验证据，不做审美判断。',
+      permissionLevel: 'read',
+      requiresConfirmation: false,
+      parameters: {
+        type: 'object',
+        properties: {
+          sheetIds: { type: 'array', items: { type: 'string' } }
+        },
+        additionalProperties: false
+      },
+      handler: async (input, context) => {
+        const batch = getBatch(context.batchId);
+        const cached = reviewSheetCache.get(context.batchId) || [];
+        const requested = Array.isArray(input?.sheetIds) && input.sheetIds.length
+          ? new Set(input.sheetIds.map(String))
+          : undefined;
+        const sheets = requested ? cached.filter((sheet) => requested.has(sheet.id)) : cached;
+        if (!sheets.length) throw new Error('ValidateReviewContactSheet 没有找到可校验的审片板。请先调用 CreateReviewContactSheets 或 CreateCompressedReviewContactSheets。');
+        const validations = await Promise.all(sheets.map(async (sheet) => {
+          const validation = await validateReviewContactSheet(sheet, batch.photos);
+          sheet.validation = validation;
+          return validation;
+        }));
+        const invalid = validations.filter((validation) => !validation.ok);
+        context.emitLog({
+          level: invalid.length ? 'warning' : 'success',
+          phase: 'vision',
+          title: '校验审片板',
+          message: invalid.length
+            ? `${invalid.length}/${validations.length} 张审片板校验不通过，需要重建或降级。`
+            : `${validations.length} 张审片板校验通过。`
+        });
+        return {
+          ok: invalid.length === 0,
+          checked: validations.length,
+          invalidSheetIds: invalid.map((validation) => validation.sheetId),
+          validations
         };
       }
     },
@@ -775,7 +1018,8 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
           sheetId: { type: 'string' },
           sheetPath: { type: 'string' },
           cells: { type: 'array', items: { type: 'object' } },
-          focusMode: { type: 'string' }
+          focusMode: { type: 'string' },
+          maxDimension: { type: 'number' }
         },
         required: ['sheetId'],
         additionalProperties: false
@@ -815,6 +1059,20 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
           })).filter((cell: ReviewContactSheet['cells'][number]) => idToPhoto.has(cell.photoId)) : []
         };
         if (!sheet.id || !sheet.path || !sheet.cells.length) throw new Error('ReviewContactSheetWithVision 缺少有效审片板。');
+        const validation = await validateReviewContactSheet(sheet, batch.photos);
+        sheet.validation = validation;
+        if (!validation.ok) {
+          throw new Error(JSON.stringify({
+            errorType: 'invalid_contact_sheet_artifact',
+            message: '审片板校验不通过，不能作为视觉证据交给大脑判断。',
+            failedSheet: sheetPayloadSummary(sheet),
+            validation,
+            recoveryOptions: [
+              { tool: 'CreateReviewContactSheets', change: 'rebuild_same_photo_ids', suggested: { photoIds: sheet.cells.map((cell) => cell.photoId), idPrefix: `${sheet.id}-rebuild` } },
+              { tool: 'CreateCompressedReviewContactSheets', change: 'rebuild_compressed', suggested: { photoIds: sheet.cells.map((cell) => cell.photoId), cellsPerSheet: sheet.cells.length, columns: sheet.params.columns, cellWidth: sheet.params.cellWidth, cellHeight: sheet.params.cellHeight, imageHeight: sheet.params.imageHeight, jpegQuality: Math.max(50, sheet.params.jpegQuality - 10), detail: 'low' } }
+            ]
+          }, null, 2));
+        }
         const config = getModelConfig();
         const visionCacheKey = cacheKey(context.batchId, config.model, sheet.id, String(input?.focusMode || 'batch'));
         const cachedVision = contactSheetVisionCache.get(visionCacheKey);
@@ -835,7 +1093,14 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
           };
         }
         let response: any;
+        let imageInput: ImageInputArtifact | undefined;
         try {
+          imageInput = await createImageInput(sheet.path, {
+            detail: sheet.params.detail,
+            maxDimension: Number(input?.maxDimension) || 2048,
+            jpegQuality: sheet.params.jpegQuality,
+            purpose: 'contact_sheet'
+          });
           response = await callChatCompletions(config, {
             response_format: { type: 'json_object' },
             messages: [
@@ -850,9 +1115,11 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
                   '允许 primaryBucket: featured, closedEyes, eyeReview, subject, technical, duplicates, similarBursts, pending。',
                   'recommendedAction 只能是 pick/reject/maybe/review/none。visualScores 字段为 visualQuality, expression, moment, composition, backgroundCleanliness, storyValue，可补充 lighting, subjectClarity, finish, deliverableScore。',
                   'visualScores 必须是 0-1 的真实差异化评分，禁止全部填 1 或全部填同一个数。',
-                  'needsHumanReview 只给真正需要人工复核或高清确认的照片；低优先级备选、明确相似淘汰、普通连拍不要全部标 true。',
+                  'recommendedAction=maybe 表示建议保留/备选 keeper，不等于不确定；recommendedAction=review 才表示需要人工复核。',
+                  'needsHumanReview 只给真正需要人工复核或高清确认的照片；低优先级备选、明确相似淘汰、普通 keeper 不要全部标 true。',
                   'featured 只能给交付级精选候选：动作/表情/构图/背景至少两项明显优秀，且 recommendedAction 必须是 pick。普通“有情绪但画面脏、逆光灰、主体糊、构图随拍”的照片应归 similarBursts/eyeReview/technical。',
-                  '如果这一页整体都是烂片，可以一个 featured 都不给；不要为了凑数而精选。'
+                  '如果这一页整体都是烂片，可以一个 featured 都不给；但有客户价值、故事串联或情绪价值的照片可以 maybe 作为 keeper，不要为了凑数而 featured。',
+                  'reason、groupReason、sheetSummary 是给摄影师看的中文说明，禁止出现 cell、keeper、featured、bucket、photoId 等内部字段或英文分组名；需要比较时说“同组相邻照片”“保留备选”“精选候选”。'
                 ].join('\n')
               },
               {
@@ -864,22 +1131,27 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
                       `sheetId=${sheet.id}`,
                       `focusMode=${String(input?.focusMode || 'batch')}`,
                       `payload=${JSON.stringify(sheetPayloadSummary(sheet))}`,
+                      `imageInput=${JSON.stringify(requestEstimateFromImageInput(imageInput))}`,
                       '每个格子底部有 cell 序号、文件名、短 id、本地分数和风险信号。',
                       '请覆盖这个 sheet 中所有 cell。如果某张只能缩略图初判，请 needsHumanReview=true，并建议是否需要单张高清精看。',
                       JSON.stringify(sheet.cells, null, 2)
                     ].join('\n')
                   },
-                  {
-                    type: 'image_url',
-                    image_url: { url: imageFileDataUrl(sheet.path), detail: sheet.params.detail }
-                  }
+                  imageInput.input
                 ]
               }
             ]
           });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          throw new Error(recoverableVisionSheetError(sheet, message));
+          recordFailedVisionArtifact(context.batchId, {
+            type: 'contact_sheet',
+            sheetId: sheet.id,
+            error: message,
+            failedSheet: sheetPayloadSummary(sheet),
+            requestEstimate: requestEstimateFromImageInput(imageInput)
+          });
+          throw new Error(recoverableVisionSheetError(sheet, message, imageInput));
         }
         const parsed = parseJsonObject(String(response.choices?.[0]?.message?.content || '{}'));
         const byPhoto = new Map<string, any>();
@@ -1048,7 +1320,11 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
         type: 'object',
         properties: {
           photoId: { type: 'string' },
-          focusMode: { type: 'string' }
+          focusMode: { type: 'string' },
+          imageMode: { type: 'string', enum: ['preview', 'original'] },
+          maxDimension: { type: 'number' },
+          jpegQuality: { type: 'number' },
+          detail: { type: 'string', enum: ['low', 'high'] }
         },
         additionalProperties: false
       },
@@ -1079,7 +1355,89 @@ export function createSenseFrameToolRegistry(): BrainToolDefinition[] {
           photoId: photo.id,
           photoFileName: photo.fileName
         });
-        const text = await callVisionModel(config, photo, 'photo', batchContext);
+        const imagePath = input?.imageMode === 'original' ? photo.filePath : photo.previewPath || photo.filePath;
+        if (!imagePath) throw new Error(`${photo.fileName} 没有可用图片路径，不能让大脑真实看图。`);
+        let imageInput: ImageInputArtifact | undefined;
+        let text = '{}';
+        try {
+          imageInput = await createImageInput(imagePath, {
+            detail: input?.detail === 'low' || input?.detail === 'high' ? input.detail : 'high',
+            maxDimension: Number(input?.maxDimension) || (input?.imageMode === 'original' ? 2048 : 1600),
+            jpegQuality: Number(input?.jpegQuality) || 85,
+            purpose: 'single_photo'
+          });
+          const group = batchContext.groupByPhoto.get(photo.id);
+          const response = await callChatCompletions(config, {
+            response_format: { type: 'json_object' },
+            messages: [
+              {
+                role: 'system',
+                content: [
+                  '你是 SenseFrame 小宫大脑的单张照片视觉分析器。',
+                  '你正在像摄影师一样高清精看一张照片，结合本地小模型、人工选择、相似组和画面语义判断它在本批次中的角色。输出只能是 JSON。',
+                  photoAestheticPrompt()
+                ].join('\n')
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: [
+                      `photoId=${photo.id}`,
+                      `file=${photo.fileName}`,
+                      `focusMode=${String(input?.focusMode || 'photo')}`,
+                      `imageMode=${String(input?.imageMode || 'preview')}`,
+                      `批次: ${batchContext.batch.name}，总照片 ${batchContext.batch.photos.length} 张，近重复组 ${batchContext.inputSnapshot.duplicateGroups} 个。`,
+                      `当前照片组信息: ${group ? `${group.groupType} ${group.groupId} 第 ${group.rank}/${group.size}` : '无'}`,
+                      `imageInput=${JSON.stringify(requestEstimateFromImageInput(imageInput))}`,
+                      '请判断这张照片最终应该进入 SenseFrame 哪个 AI 分组。',
+                      '允许的 primary_bucket/secondary_buckets: featured, closedEyes, eyeReview, subject, technical, duplicates, similarBursts, pending。',
+                      'recommended_action 只能是 pick/reject/maybe/review/none。',
+                      '不要固定精选数量。不要把 closed_eyes/face_missing/low_score 机械等同废片。',
+                      '如果小模型明显误判，请写入 small_model_overrides。',
+                      'visual_scores 使用 0-1 数值，字段: visualQuality, expression, moment, composition, backgroundCleanliness, storyValue, lighting, subjectClarity, finish, deliverableScore。',
+                      '返回 JSON keys: primary_bucket, secondary_buckets, confidence, recommended_action, reason, small_model_overrides, needs_human_review, visual_scores, aesthetic_pass, aesthetic_reject_reasons, fatal_flaws, composition_tags, representative_rank, group_reason。',
+                      '',
+                      '本地小模型和人工上下文:',
+                      JSON.stringify(photoSummary(photo), null, 2)
+                    ].join('\n')
+                  },
+                  imageInput.input
+                ]
+              }
+            ]
+          });
+          text = String(response.choices?.[0]?.message?.content || '{}');
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          recordFailedVisionArtifact(context.batchId, {
+            type: 'single_photo',
+            photoId: photo.id,
+            fileName: photo.fileName,
+            imageMode: input?.imageMode || 'preview',
+            error: message,
+            requestEstimate: requestEstimateFromImageInput(imageInput),
+            recoveryOptions: [
+              { tool: 'ReviewPhotoWithVision', change: 'lower_pixels_and_quality', suggested: { photoId: photo.id, imageMode: 'preview', maxDimension: 960, jpegQuality: 70, detail: 'low' } },
+              { tool: 'CreateCompressedReviewContactSheets', change: 'backfill_via_one_cell_sheet', suggested: { photoIds: [photo.id], cellsPerSheet: 1, columns: 1, cellWidth: 160, cellHeight: 220, imageHeight: 170, jpegQuality: 65, detail: 'low' } }
+            ]
+          });
+          throw new Error(JSON.stringify({
+            errorType: 'vision_payload_or_network_failure',
+            message,
+            failedPhoto: {
+              photoId: photo.id,
+              fileName: photo.fileName,
+              imageMode: input?.imageMode || 'preview'
+            },
+            requestEstimate: requestEstimateFromImageInput(imageInput),
+            recoveryOptions: [
+              { tool: 'ReviewPhotoWithVision', change: 'lower_pixels_and_quality', suggested: { photoId: photo.id, imageMode: 'preview', maxDimension: 960, jpegQuality: 70, detail: 'low' } },
+              { tool: 'CreateCompressedReviewContactSheets', change: 'backfill_via_one_cell_sheet', suggested: { photoIds: [photo.id], cellsPerSheet: 1, columns: 1, cellWidth: 160, cellHeight: 220, imageHeight: 170, jpegQuality: 65, detail: 'low' } }
+            ]
+          }, null, 2));
+        }
         const parsed = parseReview(text, photo, fallback.primaryBucket);
         const draft = normalizeDraftReview(parsed, photo, 'single_vision', fallback.primaryBucket);
         context.emitLog({

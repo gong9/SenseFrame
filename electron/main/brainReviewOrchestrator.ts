@@ -54,6 +54,8 @@ export async function startBrainReviewThroughRuntime(
     summary: output.summary,
     strategy: output.summary,
     debugLogPath: output.debugTraceId,
+    smartView: output.smartView,
+    uiPatch: output.uiPatch,
     reviews: []
   };
 }

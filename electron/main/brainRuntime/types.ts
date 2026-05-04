@@ -1,5 +1,6 @@
 import type {
   BrainArtifact,
+  BrainPhotoReviewDraft,
   BrainStateWrite,
   BrainUiLogEvent,
   ConfirmationRequest,
@@ -31,6 +32,7 @@ export type BrainToolContext = {
   batchId: string;
   activePhotoId?: string;
   emitLog: (event: Omit<BrainUiLogEvent, 'id' | 'sessionId' | 'createdAt' | 'traceId'>) => void;
+  getPhotoReviewDrafts?: () => BrainPhotoReviewDraft[];
 };
 
 export type BrainToolDefinition = {

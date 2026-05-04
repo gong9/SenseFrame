@@ -449,6 +449,8 @@ export type BrainRunResult = {
   strategy?: string;
   bucketCounts?: Partial<Record<BrainBucket, number>>;
   debugLogPath?: string;
+  smartView?: SmartViewSummary;
+  uiPatch?: XiaogongUiPatch;
   reviews: BrainPhotoReview[];
 };
 

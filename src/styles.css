@@ -1317,6 +1317,32 @@ button:disabled {
   background: rgba(218,194,124,0.06);
 }
 
+.brain-score-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.brain-score-summary div {
+  border: 1px solid rgba(192,215,220,0.1);
+  background: rgba(192,215,220,0.035);
+  padding: 7px 9px;
+  border-radius: 4px;
+}
+
+.brain-score-summary span {
+  display: block;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.brain-score-summary strong {
+  display: block;
+  margin-top: 2px;
+  color: #eef7f4;
+  font-size: var(--fs-body);
+}
+
 .brain-bucket-line {
   display: flex;
   align-items: center;
@@ -1379,6 +1405,7 @@ button:disabled {
 
 .brain-overrides {
   display: flex;
+  align-items: center;
   flex-wrap: wrap;
   gap: 6px;
 }
@@ -1386,18 +1413,30 @@ button:disabled {
 .brain-overrides strong,
 .brain-overrides span,
 .brain-review-alert {
-  border: 1px solid rgba(218,194,124,0.22);
-  background: rgba(218,194,124,0.07);
+  border: 1px solid rgba(218,194,124,0.16);
+  background: rgba(218,194,124,0.05);
   color: #eadca8;
-  padding: 4px 7px;
+  padding: 4px 8px;
   border-radius: 4px;
   font-size: var(--fs-xs);
 }
 
+.brain-overrides strong {
+  border-color: rgba(218,194,124,0.18);
+  background: transparent;
+  color: #d6c680;
+  font-weight: 700;
+}
+
 .brain-overrides span {
-  border-color: rgba(125,228,220,0.18);
-  background: rgba(125,228,220,0.06);
-  color: #c6efeb;
+  border-color: rgba(125,228,220,0.14);
+  background: rgba(125,228,220,0.045);
+  color: #bddbd8;
+  min-width: 0;
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .brain-review-alert {

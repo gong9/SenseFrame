@@ -1,5 +1,5 @@
 import { app } from 'electron';
-import { mkdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import sharp from 'sharp';
 import type { PhotoView } from '../shared/types';
@@ -24,6 +24,7 @@ export type ReviewContactSheet = {
   base64ApproxBytes: number;
   params: Required<ReviewContactSheetOptions>;
   cells: ReviewSheetCell[];
+  validation?: ReviewContactSheetValidation;
 };
 
 export type ReviewContactSheetOptions = {
@@ -36,6 +37,28 @@ export type ReviewContactSheetOptions = {
   jpegQuality?: number;
   detail?: 'low' | 'high';
   idPrefix?: string;
+};
+
+export type ReviewContactSheetValidation = {
+  ok: boolean;
+  sheetId: string;
+  path: string;
+  issueCodes: string[];
+  warnings: string[];
+  metrics: {
+    exists: boolean;
+    expectedCells: number;
+    actualCells: number;
+    duplicatePhotoIds: string[];
+    missingPhotoIds: string[];
+    imageWidth?: number;
+    imageHeight?: number;
+    expectedImageWidth: number;
+    expectedImageHeight: number;
+    fileSizeBytes: number;
+    base64ApproxBytes: number;
+    channelStdDev?: number;
+  };
 };
 
 const DEFAULT_OPTIONS: Required<ReviewContactSheetOptions> = {
@@ -75,16 +98,18 @@ function clampNumber(value: unknown, fallback: number, min: number, max: number)
 }
 
 function normalizeOptions(options: ReviewContactSheetOptions = {}): Required<ReviewContactSheetOptions> {
-  const cellHeight = clampNumber(options.cellHeight, DEFAULT_OPTIONS.cellHeight, 170, 420);
-  const imageHeight = clampNumber(options.imageHeight, DEFAULT_OPTIONS.imageHeight, 120, cellHeight - 32);
+  const cellHeight = clampNumber(options.cellHeight, DEFAULT_OPTIONS.cellHeight, 120, 420);
+  const imageHeight = clampNumber(options.imageHeight, DEFAULT_OPTIONS.imageHeight, 80, cellHeight - 32);
+  const cellsPerSheet = clampNumber(options.cellsPerSheet, DEFAULT_OPTIONS.cellsPerSheet, 1, 40);
+  const columns = Math.min(cellsPerSheet, clampNumber(options.columns, DEFAULT_OPTIONS.columns, 1, 8));
   return {
     photoIds: Array.isArray(options.photoIds) ? options.photoIds.map(String).filter(Boolean) : [],
-    cellsPerSheet: clampNumber(options.cellsPerSheet, DEFAULT_OPTIONS.cellsPerSheet, 4, 40),
-    columns: clampNumber(options.columns, DEFAULT_OPTIONS.columns, 2, 8),
-    cellWidth: clampNumber(options.cellWidth, DEFAULT_OPTIONS.cellWidth, 110, 320),
+    cellsPerSheet,
+    columns,
+    cellWidth: clampNumber(options.cellWidth, DEFAULT_OPTIONS.cellWidth, 80, 320),
     cellHeight,
     imageHeight,
-    jpegQuality: clampNumber(options.jpegQuality, DEFAULT_OPTIONS.jpegQuality, 45, 92),
+    jpegQuality: clampNumber(options.jpegQuality, DEFAULT_OPTIONS.jpegQuality, 32, 92),
     detail: options.detail === 'high' ? 'high' : 'low',
     idPrefix: String(options.idPrefix || DEFAULT_OPTIONS.idPrefix).replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 48) || DEFAULT_OPTIONS.idPrefix
   };
@@ -174,7 +199,7 @@ export async function createReviewContactSheets(
     }).composite(composites).jpeg({ quality: options.jpegQuality, mozjpeg: true }).toFile(output);
     const fileSizeBytes = statSync(output).size;
 
-    sheets.push({
+    const sheet: ReviewContactSheet = {
       id,
       path: output,
       index: sheetIndex + 1,
@@ -185,13 +210,84 @@ export async function createReviewContactSheets(
       base64ApproxBytes: Math.ceil(fileSizeBytes * 4 / 3),
       params: options,
       cells
-    });
+    };
+    sheet.validation = await validateReviewContactSheet(sheet, photos);
+    sheets.push(sheet);
   }
 
   return sheets;
 }
 
-export function imageFileDataUrl(path: string): string {
-  const image = readFileSync(path);
-  return `data:image/jpeg;base64,${image.toString('base64')}`;
+export async function validateReviewContactSheet(
+  sheet: ReviewContactSheet,
+  photos: PhotoView[] = []
+): Promise<ReviewContactSheetValidation> {
+  const issueCodes: string[] = [];
+  const warnings: string[] = [];
+  const knownPhotoIds = new Set(photos.map((photo) => photo.id));
+  const duplicatePhotoIds = sheet.cells
+    .map((cell) => cell.photoId)
+    .filter((photoId, index, array) => array.indexOf(photoId) !== index)
+    .filter((photoId, index, array) => array.indexOf(photoId) === index);
+  const missingPhotoIds = sheet.cells
+    .map((cell) => cell.photoId)
+    .filter((photoId) => knownPhotoIds.size > 0 && !knownPhotoIds.has(photoId));
+  const expectedCells = sheet.cells.length;
+  let fileSizeBytes = 0;
+  let imageWidth: number | undefined;
+  let imageHeight: number | undefined;
+  let channelStdDev: number | undefined;
+  const exists = existsSync(sheet.path);
+
+  if (!exists) {
+    issueCodes.push('sheet_file_missing');
+  } else {
+    fileSizeBytes = statSync(sheet.path).size;
+    if (fileSizeBytes <= 0) issueCodes.push('sheet_file_empty');
+    try {
+      const image = sharp(sheet.path, { failOn: 'none', limitInputPixels: false });
+      const metadata = await image.metadata();
+      imageWidth = metadata.width;
+      imageHeight = metadata.height;
+      if (imageWidth !== sheet.imageWidth || imageHeight !== sheet.imageHeight) {
+        issueCodes.push('sheet_dimension_mismatch');
+      }
+      const stats = await image.stats();
+      const deviations = stats.channels.map((channel) => channel.stdev).filter((value) => Number.isFinite(value));
+      channelStdDev = deviations.length ? Number((deviations.reduce((sum, value) => sum + value, 0) / deviations.length).toFixed(3)) : undefined;
+      if (channelStdDev !== undefined && channelStdDev < 2) {
+        issueCodes.push('sheet_probably_blank');
+      }
+    } catch (error) {
+      issueCodes.push('sheet_decode_failed');
+      warnings.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  if (!expectedCells) issueCodes.push('sheet_has_no_cells');
+  if (duplicatePhotoIds.length) issueCodes.push('sheet_duplicate_photo_ids');
+  if (missingPhotoIds.length) issueCodes.push('sheet_unknown_photo_ids');
+  if (sheet.fileSizeBytes !== fileSizeBytes && fileSizeBytes > 0) warnings.push('sheet_file_size_changed_after_generation');
+
+  return {
+    ok: issueCodes.length === 0,
+    sheetId: sheet.id,
+    path: sheet.path,
+    issueCodes,
+    warnings,
+    metrics: {
+      exists,
+      expectedCells,
+      actualCells: sheet.cells.length,
+      duplicatePhotoIds,
+      missingPhotoIds,
+      imageWidth,
+      imageHeight,
+      expectedImageWidth: sheet.imageWidth,
+      expectedImageHeight: sheet.imageHeight,
+      fileSizeBytes,
+      base64ApproxBytes: Math.ceil(fileSizeBytes * 4 / 3),
+      channelStdDev
+    }
+  };
 }

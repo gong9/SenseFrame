@@ -2,7 +2,9 @@
 
 [English](README.md) | 简体中文
 
-![SenseFrame 桌面审片工作台](docs/assets/senseframe-main-2026-05-02.png)
+![SenseFrame 首页](docs/assets/senseframe-home-2026-05-04.png)
+
+![SenseFrame 桌面审片工作台](docs/assets/senseframe-main-2026-05-04.png)
 
 SenseFrame 是一个面向摄影师的本地优先 AI 选片工作台，适合需要处理大量素材、但仍希望掌握最终审美判断的人。
 
